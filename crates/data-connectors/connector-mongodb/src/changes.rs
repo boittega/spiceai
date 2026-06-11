@@ -494,12 +494,15 @@ async fn open_change_stream(
 }
 
 /// Returns `true` if the driver error indicates the resume token is past the
-/// oplog retention window (`ChangeStreamHistoryLost`, code 286) or the cursor
-/// is otherwise unresumable (`ChangeStreamFatalError`, code 280).
+/// oplog retention window or the cursor is otherwise unresumable:
+/// - 136 `CappedPositionLost`: the oplog (a capped collection) wrapped and
+///   deleted entries that the change stream cursor had not yet consumed.
+/// - 280 `ChangeStreamFatalError`: the cursor is unresumable.
+/// - 286 `ChangeStreamHistoryLost`: resume token is past the oplog window.
 fn is_stale_resume_token_error(error: &mongodb::error::Error) -> bool {
     matches!(
         error.kind.as_ref(),
-        mongodb::error::ErrorKind::Command(cmd) if matches!(cmd.code, 286 | 280)
+        mongodb::error::ErrorKind::Command(cmd) if matches!(cmd.code, 136 | 280 | 286)
     )
 }
 
