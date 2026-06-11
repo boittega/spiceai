@@ -40,6 +40,13 @@ pub(crate) fn generate_mongodb_spicepod(
             enabled: false,
             ..TelemetryConfig::default()
         },
+        params: std::collections::HashMap::from([
+            // Coalesce more CDC envelopes per write to reduce cayenne lock acquisitions.
+            ("cdc_max_coalesced_envelopes".to_string(), "10000".to_string()),
+            ("cdc_max_coalesced_bytes".to_string(), "134217728".to_string()), // 128 MB
+            ("cdc_max_coalesce_age_ms".to_string(), "500".to_string()),
+            ("cdc_prefetch_buffer".to_string(), "4096".to_string()),
+        ]),
         ..Runtime::default()
     };
 
@@ -53,7 +60,12 @@ pub(crate) fn generate_mongodb_spicepod(
             let sep = if uri.contains('?') { "&" } else { "?" };
             format!("{uri}{sep}tls=false")
         };
-        let param_map = HashMap::from([("mongodb_connection_string".to_string(), conn_str)]);
+        let param_map = HashMap::from([
+            ("mongodb_connection_string".to_string(), conn_str),
+            // Increase cursor batch sizes to reduce round-trips on high-volume streams.
+            ("change_stream_batch_size".to_string(), "10000".to_string()),
+            ("change_stream_batch_max_size".to_string(), "10000".to_string()),
+        ]);
 
         // MongoDB change stream delete events only carry `_id`, so we use `_id` as
         // the acceleration primary key. The sink computes `_id` from the TPC-H PK columns.

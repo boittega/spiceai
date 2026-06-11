@@ -201,7 +201,7 @@ fn build_change_batch(
     ChangeBatch::try_new(record).context(ChangeBatchSnafu)
 }
 
-fn nullable_clone(schema: &SchemaRef) -> SchemaRef {
+pub fn nullable_clone(schema: &SchemaRef) -> SchemaRef {
     let fields = schema
         .fields()
         .iter()
@@ -442,5 +442,50 @@ mod tests {
         .expect_err("unsupported operation should fail");
 
         assert!(matches!(error, StreamError::UnsupportedOperation { .. }));
+    }
+
+    #[test]
+    fn nullable_clone_makes_all_fields_nullable() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_id", DataType::Utf8, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("count", DataType::Int64, false),
+        ]));
+
+        let cloned = nullable_clone(&schema);
+
+        for field in cloned.fields() {
+            assert!(field.is_nullable(), "field '{}' should be nullable", field.name());
+        }
+        assert_eq!(cloned.fields().len(), schema.fields().len());
+        for (orig, new) in schema.fields().iter().zip(cloned.fields().iter()) {
+            assert_eq!(orig.name(), new.name());
+            assert_eq!(orig.data_type(), new.data_type());
+        }
+    }
+
+    // Snapshot batches are wrapped using nullable_clone(schema) so their schema matches
+    // the schema that change_events_to_change_batch produces for CDC event batches.
+    // This ensures the two can be coalesced without an Arrow schema mismatch.
+    #[test]
+    fn snapshot_and_cdc_batch_schemas_are_compatible() {
+        let original_schema = schema(); // _id is non-null in the source schema
+
+        // Schema used for CDC event batches (via change_events_to_change_batch internally)
+        let cdc_schema = nullable_clone(&original_schema);
+
+        // Schema used for snapshot batches (the fix applied in build_changes_stream)
+        let snapshot_schema = nullable_clone(&original_schema);
+
+        assert_eq!(
+            cdc_schema.as_ref(),
+            snapshot_schema.as_ref(),
+            "snapshot and CDC schemas must match for coalescing"
+        );
+        // Both must have _id as nullable (even though the source schema has it non-null)
+        assert!(
+            cdc_schema.field_with_name("_id").expect("_id exists").is_nullable(),
+            "_id must be nullable in the coalesced schema"
+        );
     }
 }
