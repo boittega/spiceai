@@ -53,7 +53,12 @@ pub(crate) fn generate_mongodb_spicepod(
             let sep = if uri.contains('?') { "&" } else { "?" };
             format!("{uri}{sep}tls=false")
         };
-        let param_map = HashMap::from([("mongodb_connection_string".to_string(), conn_str)]);
+        let param_map = HashMap::from([
+            ("mongodb_connection_string".to_string(), conn_str),
+            // Increase cursor batch sizes to reduce round-trips on high-volume streams.
+            ("change_stream_batch_size".to_string(), "10000".to_string()),
+            ("change_stream_batch_max_size".to_string(), "10000".to_string()),
+        ]);
 
         // MongoDB change stream delete events only carry `_id`, so we use `_id` as
         // the acceleration primary key. The sink computes `_id` from the TPC-H PK columns.
@@ -67,7 +72,7 @@ pub(crate) fn generate_mongodb_spicepod(
 
         // Add `_id` as the first column (string key the sink writes), then all data columns.
         let mut columns: Vec<Column> =
-            vec![Column::new("_id").with_type("Utf8").with_nullable(false)];
+            vec![Column::new("_id").with_type("Utf8").with_nullable(true)];
         columns.extend(dataset_config.schema.fields().iter().map(|field| {
             Column::new(field.name())
                 .with_type(mongodb_arrow_type_to_spicepod_str(field.data_type()))
