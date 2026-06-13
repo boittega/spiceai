@@ -1063,11 +1063,12 @@ impl Handler for SpidapterHandler {
             .get(&run_id)
             .ok_or_else(|| format!("No active run found for {run_id}"))?;
 
-        // Derive the Prometheus metrics URL. For SCP the gateway serves metrics
-        // on the same host as SQL, so swap the path. For the local backend,
-        // spiced serves Prometheus on a dedicated `--metrics` port
-        // (SPIDAPTER_METRICS_PORT) that differs from the HTTP/SQL port, so the
-        // path swap alone would hit the SQL port and return nothing.
+        // Derive the Prometheus metrics URL.
+        // - SCP: the gateway serves Prometheus at `/v1/metrics` (same host as
+        //   `/v1/sql`), so swap only the trailing path segment and keep `/v1`.
+        // - Local: spiced serves Prometheus on a dedicated `--metrics` port
+        //   (SPIDAPTER_METRICS_PORT) at `/metrics`, distinct from the HTTP/SQL
+        //   port — the path swap alone would hit the SQL port and return nothing.
         let prometheus_url = match state {
             RunState::Local(_) => match std::env::var("SPIDAPTER_METRICS_PORT") {
                 Ok(port) if !port.trim().is_empty() => {
@@ -1075,7 +1076,7 @@ impl Handler for SpidapterHandler {
                 }
                 _ => state.sql_url().replace("/v1/sql", "/metrics"),
             },
-            RunState::Scp(_) => state.sql_url().replace("/v1/sql", "/metrics"),
+            RunState::Scp(_) => state.sql_url().replace("/v1/sql", "/v1/metrics"),
         };
         let api_key = state.api_key().map(|k| k.to_string());
 
