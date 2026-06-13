@@ -413,11 +413,6 @@ fn parse_labeled(body: &str, name: &str) -> std::collections::HashMap<String, f6
     out
 }
 
-/// Parse `_sum` values for a metric across all datasets.
-fn parse_metric_sums(body: &str, metric: &str) -> std::collections::HashMap<String, f64> {
-    parse_labeled(body, &format!("{metric}_sum"))
-}
-
 /// Build the vendor-neutral `CdcReplicationMetrics` from spiced's Prometheus
 /// text, mapping spiced's MongoDB/cayenne metric names onto the generic
 /// per-table contract. Returns `None` when no CDC metrics are present (e.g. a
@@ -470,47 +465,6 @@ fn build_cdc_replication_metrics(body: &str) -> Option<CdcReplicationMetrics> {
         .collect();
 
     Some(CdcReplicationMetrics { per_table })
-}
-
-/// Print a CDC bottleneck analysis to stderr from raw Prometheus metrics text.
-fn print_cdc_bottleneck_analysis(body: &str) {
-    let recv = parse_metric_sums(body, "dataset_acceleration_cdc_source_recv_wait_ms");
-    let apply = parse_metric_sums(body, "dataset_acceleration_cdc_apply_burst_duration_ms");
-
-    let mut datasets: Vec<String> = recv.keys()
-        .chain(apply.keys())
-        .cloned()
-        .collect::<std::collections::HashSet<_>>()
-        .into_iter()
-        .collect();
-    datasets.sort();
-
-    if datasets.is_empty() {
-        eprintln!("[stdio] CDC bottleneck analysis: no CDC metrics found");
-        return;
-    }
-
-    eprintln!("[stdio] CDC bottleneck analysis (spice vs mongo):");
-    eprintln!("[stdio]   {:<15} {:>12} {:>10} {:>9}  verdict",
-        "dataset", "recv_wait_s", "apply_s", "recv_%");
-    eprintln!("[stdio]   {}", "-".repeat(68));
-
-    for ds in &datasets {
-        let recv_ms = recv.get(ds).copied().unwrap_or(0.0);
-        let apply_ms = apply.get(ds).copied().unwrap_or(0.0);
-        let total = recv_ms + apply_ms;
-        if total < 1.0 { continue; }
-        let recv_pct = 100.0 * recv_ms / total;
-        let verdict = if recv_pct > 70.0 {
-            "MONGO CDC bottleneck (spice idle)"
-        } else if recv_pct < 30.0 {
-            "SPICE bottleneck (cayenne apply)"
-        } else {
-            "balanced"
-        };
-        eprintln!("[stdio]   {:<15} {:>12.1} {:>10.1} {:>8.1}%  {}",
-            ds, recv_ms / 1000.0, apply_ms / 1000.0, recv_pct, verdict);
-    }
 }
 
 /// System adapter handler that provisions Spice Cloud apps.
@@ -1056,7 +1010,7 @@ impl Handler for SpidapterHandler {
     async fn metrics(
         &mut self,
         run_id: Uuid,
-        final_scrape: bool,
+        _final_scrape: bool,
     ) -> std::result::Result<MetricsResponse, String> {
         let state = self
             .runs
@@ -1080,53 +1034,20 @@ impl Handler for SpidapterHandler {
         };
         let api_key = state.api_key().map(|k| k.to_string());
 
-        eprintln!(
-            "[stdio] metrics(run_id={run_id}, final_scrape={final_scrape}): scraping {prometheus_url} (api_key={})",
-            api_key.is_some()
-        );
-
-        // Scrape Prometheus metrics once and reuse for both the CDC replication
-        // payload (every scrape) and the bottleneck analysis (final scrape only).
+        // Scrape Prometheus metrics for the CDC replication payload.
         let prom_body = match fetch_prometheus_metrics(&prometheus_url, api_key.as_deref()).await {
             Ok(body) => {
                 let cdc_lines = body
                     .lines()
                     .filter(|l| l.starts_with("dataset_acceleration_cdc_"))
                     .count();
-                eprintln!(
-                    "[stdio] metrics: fetched {} bytes, {cdc_lines} dataset_acceleration_cdc_* lines",
-                    body.len()
-                );
                 Some(body)
             }
             Err(e) => {
-                eprintln!("[stdio] metrics: prometheus scrape FAILED: {e}");
                 None
             }
         };
-        if final_scrape {
-            if let Some(body) = &prom_body {
-                print_cdc_bottleneck_analysis(body);
-            }
-        }
         let cdc_replication = prom_body.as_deref().and_then(build_cdc_replication_metrics);
-        match &cdc_replication {
-            Some(cdc) => {
-                eprintln!(
-                    "[stdio] metrics: cdc_replication has {} table(s): {}",
-                    cdc.per_table.len(),
-                    cdc.per_table
-                        .iter()
-                        .map(|t| format!(
-                            "{}(wait={:?} apply={:?} rows={:?})",
-                            t.table, t.source_wait_ms, t.apply_ms, t.rows_applied
-                        ))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-            }
-            None => eprintln!("[stdio] metrics: cdc_replication = None (no CDC metrics parsed)"),
-        }
 
         match state {
             RunState::Scp(scp) => {
