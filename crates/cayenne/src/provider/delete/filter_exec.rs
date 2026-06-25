@@ -68,6 +68,7 @@ limitations under the License.
 
 use crate::provider::deletion_index::{DeletionIndex, KeyDeletionIndex, Tombstone};
 use arrow::array::{ArrayRef, BooleanArray, BooleanBufferBuilder};
+use arrow::compute::{max as arrow_col_max, min as arrow_col_min};
 use arrow_row::RowConverter;
 use datafusion::config::ConfigOptions;
 use datafusion_execution::SendableRecordBatchStream;
@@ -106,6 +107,11 @@ struct DeletionFilterMetrics {
     /// removed. A nonzero count means the snapshot's watermark OVER-CLAIMS what
     /// it baked: a delete is silently dropped at scan time → resurrected row.
     resurrected_by_threshold: Count,
+    /// Rows in batches that took the disjoint-range fast path (PK range entirely
+    /// outside the deleted-key range) and skipped the per-row probe entirely.
+    /// Near-zero on hash-clustered data (every batch spans the deleted range);
+    /// near-`scanned` on PK-ordered data with a localized delete.
+    rows_range_skipped: Count,
 }
 
 impl DeletionFilterMetrics {
@@ -115,6 +121,8 @@ impl DeletionFilterMetrics {
             rows_deleted: MetricBuilder::new(metrics).counter("rows_deleted", partition),
             resurrected_by_threshold: MetricBuilder::new(metrics)
                 .counter("resurrected_by_threshold", partition),
+            rows_range_skipped: MetricBuilder::new(metrics)
+                .counter("rows_range_skipped", partition),
         }
     }
 }
@@ -952,13 +960,15 @@ impl futures::Stream for Int64PkDeletionFilterStream {
                     // Honors `min_delete_seq_to_apply`/insert records trivially
                     // because it only fires when there is nothing to apply.
                     if let Some((del_lo, del_hi)) = self.tombstones.deleted_key_range() {
-                        let mut bmin = i64::MAX;
-                        let mut bmax = i64::MIN;
-                        for &v in pk_slice {
-                            bmin = bmin.min(v);
-                            bmax = bmax.max(v);
-                        }
-                        if bmax < del_lo || bmin > del_hi {
+                        // Vectorized (SIMD) batch min/max via Arrow's aggregate
+                        // kernel instead of a scalar loop, so deciding the
+                        // disjoint-range skip is ~free per batch rather than an
+                        // O(rows) scalar pass that was paid even on skipped batches.
+                        if let (Some(bmin), Some(bmax)) =
+                            (arrow_col_min(pk_array), arrow_col_max(pk_array))
+                            && (bmax < del_lo || bmin > del_hi)
+                        {
+                            self.metrics.rows_range_skipped.add(batch_size);
                             self.metrics.baseline.record_output(batch_size);
                             return std::task::Poll::Ready(Some(Ok(batch)));
                         }
