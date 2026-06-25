@@ -381,6 +381,16 @@ impl CayenneContext {
     /// Maximum rows in one write that may be inlined into the metastore.
     #[must_use]
     pub(crate) fn inline_max_rows(&self) -> usize {
+        // DEBUG override (root-cause loop): pin inline_max_rows via
+        // `CAYENNE_INLINE_MAX_ROWS`. Set to 0 to DISABLE the inline tier entirely
+        // (writes go straight to Vortex files), bypassing the inline-flush
+        // snapshot-publish path — used to test whether the over-claim is minted
+        // at the inline flush. Bypasses the auto-tuner.
+        if let Ok(v) = std::env::var("CAYENNE_INLINE_MAX_ROWS")
+            && let Ok(n) = v.trim().parse::<usize>()
+        {
+            return n;
+        }
         self.config.inline_max_rows
     }
 
@@ -465,6 +475,16 @@ impl CayenneContext {
     /// [`crate::provider::table::BAKE_DELETION_INDEX_TRIGGER`]).
     #[must_use]
     pub(crate) fn bake_deletion_index_trigger(&self) -> usize {
+        // DEBUG override (root-cause loop): pin the seq-prefix bake trigger via
+        // `CAYENNE_BAKE_DELETION_INDEX_TRIGGER`. Set very high to effectively
+        // DISABLE the bake and test whether over-claimed watermarks persist
+        // (resurrect permanently) without the bake's self-heal. Bypasses the
+        // adaptive actuator entirely.
+        if let Ok(v) = std::env::var("CAYENNE_BAKE_DELETION_INDEX_TRIGGER")
+            && let Ok(n) = v.trim().parse::<usize>()
+        {
+            return n;
+        }
         self.live_actuators.bake_deletion_index_trigger()
     }
 

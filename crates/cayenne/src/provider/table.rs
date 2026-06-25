@@ -130,7 +130,7 @@ use vortex_datafusion::VortexFormat;
 use vortex_datafusion::WriteShardConfig;
 
 use super::context::CayenneContext;
-use super::deletion_index::{DeletionIndex, KeyDeletionIndex};
+use super::deletion_index::{DeletionIndex, KeyDeletionIndex, Tombstone};
 use super::deletion_strategy::{
     Int64PkDeletionSnapshot, PkDeletionStrategy, PkDeletionStrategyWithCache, PositionBitmap,
     PositionDeletionVector, RowConverterDeletionSnapshot,
@@ -3448,6 +3448,64 @@ const PROTECTED_MERGE_MAX_WIDTH: usize = 32;
 /// snapshots OLDER than this tail. With fewer than `K + 1` protected snapshots
 /// there is no settled prefix and the bake is a no-op.
 const BAKE_KEEP_RECENT_SNAPSHOTS: usize = 3;
+
+/// DEBUG: recursively sum a named per-partition metric (e.g. `rows_deleted`)
+/// across an executed `ExecutionPlan` tree. Used by the seq-prefix bake to report
+/// how many rows its deletion filter physically removed, for comparison against
+/// the number of tombstones the subsequent prune dropped.
+fn sum_plan_metric(plan: &Arc<dyn ExecutionPlan>, name: &str) -> u64 {
+    let mut total = plan
+        .metrics()
+        .and_then(|m| m.sum_by_name(name))
+        .map(|v| v.as_usize() as u64)
+        .unwrap_or(0);
+    for child in plan.children() {
+        total += sum_plan_metric(child, name);
+    }
+    total
+}
+
+/// DEBUG: enable the creation-time watermark-honesty audit
+/// (`CAYENNE_WATERMARK_AUDIT=1`). Off by default — the audit double-scans every
+/// freshly-stamped snapshot, so it's investigation-only.
+fn watermark_audit_enabled() -> bool {
+    std::env::var("CAYENNE_WATERMARK_AUDIT")
+        .map(|v| {
+            let t = v.trim();
+            !t.is_empty() && t != "0"
+        })
+        .unwrap_or(false)
+}
+
+/// DEBUG kill-switch (`CAYENNE_DISABLE_COMPACTION=1`): when set, ALL
+/// protected-snapshot compaction is suppressed — both the fast size-tier subset
+/// merge AND the heavy seq-prefix bake (and its deletion-index prune). Used to
+/// test whether the row-resurrection bug reproduces with no compaction at all.
+/// Snapshots and the deletion index grow unbounded (reads get slow), but no
+/// over-claim is minted and no tombstone is pruned.
+fn compaction_disabled() -> bool {
+    std::env::var("CAYENNE_DISABLE_COMPACTION")
+        .map(|v| {
+            let t = v.trim();
+            !t.is_empty() && t != "0"
+        })
+        .unwrap_or(false)
+}
+
+/// DEBUG kill-switch (`CAYENNE_DISABLE_TOMBSTONE_PRUNE=1`): keep ALL compaction
+/// running (fast subset + the seq-prefix bake's merge, including its `fence_max`
+/// watermark stamping) but skip ONLY the deletion-index prune. Isolates whether
+/// the *prune* is the permanence trigger: if the run converges with this set,
+/// the over-claim alone is transient and the prune is what makes resurrection
+/// permanent.
+fn tombstone_prune_disabled() -> bool {
+    std::env::var("CAYENNE_DISABLE_TOMBSTONE_PRUNE")
+        .map(|v| {
+            let t = v.trim();
+            !t.is_empty() && t != "0"
+        })
+        .unwrap_or(false)
+}
 
 /// Default deletion-index size (count of live PK tombstones, `delete_len()`) at
 /// or above which a seq-prefix bake is worth triggering. The bake exists to
@@ -7529,6 +7587,12 @@ impl CayenneTableProvider {
         Ok(())
     }
 
+    /// Returns the configured primary-key column names (empty if none).
+    #[must_use]
+    pub fn primary_key_column_names(&self) -> Vec<String> {
+        self.table_metadata.primary_key.clone()
+    }
+
     /// Returns the column indices for the configured primary key, if any.
     fn primary_key_indices(&self) -> Result<Option<Vec<usize>>> {
         if self.table_metadata.primary_key.is_empty() {
@@ -8637,8 +8701,17 @@ impl CayenneTableProvider {
                 let updated = current
                     .tombstones
                     .extend_max_deletes(deleted_pk_i64.iter().map(|&pk| (pk, delete_sequence)));
+                let index_len = updated.len();
                 deletion_snapshot.store(Arc::new(Int64PkDeletionSnapshot::from_index(updated)));
                 self.refresh_deletion_memory_accounting();
+                tracing::info!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    recorded = deleted_pk_i64.len(),
+                    delete_sequence,
+                    deletion_index_len = index_len,
+                    "Recorded file-side deletions into deletion index (int64 pk)",
+                );
             }
             PkDeletionStrategyWithCache::RowConverterBased {
                 deletion_snapshot, ..
@@ -8650,9 +8723,18 @@ impl CayenneTableProvider {
                 let updated = current
                     .tombstones
                     .extend_max_deletes(deleted_row_keys.iter().map(|key| (key, delete_sequence)));
+                let index_len = updated.len();
                 deletion_snapshot
                     .store(Arc::new(RowConverterDeletionSnapshot::from_index(updated)));
                 self.refresh_deletion_memory_accounting();
+                tracing::info!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    recorded = deleted_row_keys.len(),
+                    delete_sequence,
+                    deletion_index_len = index_len,
+                    "Recorded file-side deletions into deletion index (row-converter pk)",
+                );
             }
             PkDeletionStrategyWithCache::PositionBased { .. } => {
                 // Position-based tables don't support upserts.
@@ -9717,6 +9799,14 @@ impl CayenneTableProvider {
             "Published staged on-conflict snapshot"
         );
 
+        // NOTE: CDC-publish snapshot honesty is NOT audited here — this finalize
+        // path is synchronous (called under the publish lock) so it can't run the
+        // async audit scan. A dishonest CDC snapshot instead surfaces at the FIRST
+        // compaction that ingests it, as `rows_resurrected_during_rewrite > 0` on
+        // that compaction's input audit (and the output `audit_watermark_honesty`).
+        // If that points back to CDC publish, investigate the upsert tombstone /
+        // `snapshot_sequence` assignment here.
+
         Ok(())
     }
 
@@ -10707,6 +10797,10 @@ impl CayenneTableProvider {
     }
 
     pub(crate) fn schedule_post_write_compaction(&self) {
+        // DEBUG kill-switch: don't even schedule post-write compaction.
+        if compaction_disabled() {
+            return;
+        }
         let cfg = self.context.compaction_picker_config();
         let maintenance_trigger = self.protected_snapshot_maintenance_trigger();
         if self.new_files_since_last_compaction.load(Ordering::Relaxed) < cfg.trigger_files
@@ -12431,8 +12525,29 @@ impl CayenneTableProvider {
         } else {
             UnionExec::try_new(plans)?
         };
+        // DEBUG: handle for reading the rewrite's deletion-filter metrics after it
+        // runs. `resurrected_by_threshold > 0` here is the SMOKING GUN: the rewrite
+        // KEPT rows whose tombstone an input's threshold suppressed, then stamps
+        // the merged output with `fence_max_delete_seq` — propagating an
+        // over-claimed watermark into a new snapshot (the delete-loss bug).
+        let metrics_plan = Arc::clone(&merged_plan);
         let stream = datafusion_physical_plan::execute_stream(merged_plan, state.task_ctx())?;
         let plan_build_ms = phase2_start.elapsed().as_millis();
+
+        // DEBUG: per-input threshold vs the fence we will stamp on the output.
+        // `fence_max_delete_seq > min(thresholds)` means the output watermark
+        // claims more deletes baked than the least-baked input actually had.
+        for (snapshot_id, threshold) in &inputs {
+            tracing::debug!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                input = &snapshot_id[..snapshot_id.len().min(13)],
+                threshold,
+                fence_max_delete_seq,
+                stamps_higher_than_input = fence_max_delete_seq > *threshold,
+                "Fast subset compaction input vs stamped fence"
+            );
+        }
 
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
         let is_s3 = self.table_metadata.path.starts_with("s3://");
@@ -12620,13 +12735,26 @@ impl CayenneTableProvider {
         self.retire_snapshot_dirs(old_ids.iter().map(String::as_str));
         self.sweep_retired_snapshot_dirs();
 
+        // DEBUG: rows the rewrite physically removed, and rows it KEPT despite a
+        // tombstone the input threshold suppressed (the over-claim being baked
+        // into this output snapshot — should be 0).
+        let rows_deleted_by_filter = sum_plan_metric(&metrics_plan, "rows_deleted");
+        let rows_resurrected_during_rewrite = sum_plan_metric(&metrics_plan, "resurrected_by_threshold");
+        let min_input_threshold = inputs.iter().map(|(_, t)| *t).min().unwrap_or(0);
+        let max_input_threshold = inputs.iter().map(|(_, t)| *t).max().unwrap_or(0);
+
         tracing::info!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
             merged_inputs = inputs.len(),
             rows = total_rows,
+            rows_deleted_by_filter,
+            rows_resurrected_during_rewrite,
+            min_input_threshold,
+            max_input_threshold,
             new_snapshot_id = new_snapshot_id.as_str(),
             fence_max_delete_seq,
+            watermark_over_claims = fence_max_delete_seq > min_input_threshold,
             total_input_bytes,
             largest_input_bytes,
             dominance_pct,
@@ -12639,6 +12767,15 @@ impl CayenneTableProvider {
             duration_ms = compaction_start.elapsed().as_millis(),
             "Fast protected-snapshot subset compaction completed"
         );
+
+        // DEBUG: is the merged OUTPUT honest about the watermark (fence) we just
+        // stamped on it? `rows_resurrected_during_rewrite` above audits the INPUTS
+        // (using their thresholds); this audits the OUTPUT at `fence`. If the
+        // output is dishonest while inputs were honest (rows_resurrected==0), this
+        // compaction MINTED the over-claim; if inputs were already dishonest, it
+        // propagated it.
+        self.audit_watermark_honesty(&new_snapshot_id, fence_max_delete_seq, "fast_subset")
+            .await;
 
         // Record the merged *output* size so operators (and the adaptive tuner's
         // observability) can see whether compaction is trending toward the target
@@ -12760,35 +12897,517 @@ impl CayenneTableProvider {
             .cloned()
             .collect();
         live_ids.push(current_snapshot_id.clone());
+        // DEBUG INSTRUMENTATION: evaluate EVERY live snapshot (don't short-circuit)
+        // and fetch its manifest even when the watermark would exempt it, so the
+        // per-snapshot log can show the true `min_sequence` vs T next to the
+        // watermark. The decision semantics are unchanged (watermark >= T still
+        // wins authoritatively); the extra `get_snapshot_files` for exempt
+        // snapshots is added I/O for the investigation only. A snapshot whose
+        // watermark claims clean (`watermark_exempt`) but whose `min_sequence <= T`
+        // is the smoking gun: the prune drops <= T tombstones for rows that
+        // snapshot still physically holds → resurrection.
+        let mut first_violation: Option<i64> = None;
+        let mut clean_count = 0usize;
+        let mut block_count = 0usize;
         for id in &live_ids {
-            // Delete-watermark exemption (authoritative, no I/O): a protected
-            // snapshot whose watermark covers T is clean past T regardless of its
-            // write-range. The current snapshot has no entry here.
             let watermark = protected.get(id).copied();
-            if watermark.is_some_and(|w| w >= prefix_cutoff) {
-                continue;
-            }
+            let is_current = id == &current_snapshot_id;
             let files = self
                 .catalog
                 .get_snapshot_files(&self.table_metadata.table_id, id)
                 .await
                 .unwrap_or_default();
-            if files.is_empty() {
-                if id == &current_snapshot_id {
-                    continue; // genesis current snapshot: no rows to resurrect
+            let min_seq = files.iter().map(|f| f.min_sequence).min();
+
+            let (clean, reason, violation): (bool, &str, Option<i64>) =
+                if watermark.is_some_and(|w| w >= prefix_cutoff) {
+                    (true, "watermark_exempt", None)
+                } else if files.is_empty() {
+                    if is_current {
+                        (true, "genesis_current", None)
+                    } else {
+                        (false, "empty_manifest_blocks", watermark.or(Some(-1)))
+                    }
+                } else if let Some(ms) = min_seq.filter(|ms| *ms <= prefix_cutoff) {
+                    (false, "min_seq_le_T", Some(ms))
+                } else {
+                    (true, "all_rows_above_T", None)
+                };
+
+            if clean {
+                clean_count += 1;
+            } else {
+                block_count += 1;
+                if first_violation.is_none() {
+                    first_violation = violation;
                 }
-                // Protected snapshot, empty manifest, watermark `< T` (or — never,
-                // for an in-map snapshot — absent): ranges unknown, cannot prove
-                // clean past T, so block this pass.
-                return (false, watermark.or(Some(-1)));
             }
-            for f in &files {
-                if f.min_sequence <= prefix_cutoff {
-                    return (false, Some(f.min_sequence));
+
+            // Flag the smoking-gun case loudly: watermark exempted it, yet the
+            // manifest shows rows at/below T that a <= T tombstone could delete.
+            let watermark_lies =
+                reason == "watermark_exempt" && min_seq.is_some_and(|ms| ms <= prefix_cutoff);
+            tracing::info!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                snapshot = &id[..id.len().min(13)],
+                is_current,
+                prefix_cutoff,
+                watermark = watermark.unwrap_or(-1),
+                min_sequence = min_seq.unwrap_or(-1),
+                files = files.len(),
+                clean,
+                reason,
+                watermark_lies,
+                "Clean-prefix gate: per-snapshot verdict"
+            );
+        }
+
+        let holds = block_count == 0;
+        tracing::info!(
+            target: "cayenne::compaction",
+            table = self.table_metadata.table_name.as_str(),
+            prefix_cutoff,
+            live_snapshots = live_ids.len(),
+            clean = clean_count,
+            blocking = block_count,
+            holds,
+            "Clean-prefix gate decision"
+        );
+        (holds, first_violation)
+    }
+
+    /// Classify what the `<= cutoff` (`T`) prune does to the row covered by
+    /// tombstone `t`, in a live snapshot whose read-watermark is `watermark`
+    /// (`None` = the current snapshot, which applies ALL deletions). Returns
+    /// `(cemented, exposed)`.
+    ///
+    /// Only tombstones in the pruned band (`delete_seq <= T`) on a NOT-re-inserted
+    /// key matter (a re-insert `insert_seq > delete_seq` means the key is
+    /// legitimately live, so the prune changes nothing). For those:
+    ///   - **`cemented`** — the snapshot currently EXEMPTS this tombstone
+    ///     (`delete_seq <= watermark`), so it ALREADY SHOWS the deleted row: an
+    ///     over-count minted by a watermark over-claim (fast-subset stamping
+    ///     `fence_max`). The row is visible *now*, independent of the prune.
+    ///     Pruning the tombstone destroys the only record an apply-all-deletions
+    ///     pass (current-snapshot read, keyset rebuild, honest re-bake) could use
+    ///     to reconcile (re-hide) it → the over-count becomes PERMANENT. THIS is
+    ///     the confirmed bug's signature.
+    ///   - **`exposed`** — the snapshot currently APPLIES this tombstone
+    ///     (`watermark = None`, or `delete_seq > watermark`), so the row is hidden
+    ///     now and the prune flips it hidden→visible. (The original hypothesis;
+    ///     observed to be 0 in practice — the rows are exempt-and-shown, not
+    ///     hidden-then-exposed.)
+    ///
+    /// Mirrors the exact read-path visibility decision (`apply_partial_deletion_filter`
+    /// / `DeletionIndex::get_with_min_seq`): a tombstone is applied iff
+    /// `delete_seq > watermark`.
+    fn classify_prune_effect(t: &Tombstone, watermark: Option<i64>, cutoff: i64) -> (bool, bool) {
+        let reinserted = t.insert_sequence.is_some_and(|i| i > t.delete_sequence);
+        if reinserted || t.delete_sequence > cutoff {
+            return (false, false);
+        }
+        let applies_now = match watermark {
+            None => true,                     // current snapshot applies all deletions
+            Some(w) => t.delete_sequence > w, // protected: only deletes above its watermark
+        };
+        // (cemented = shown-despite-delete, prune makes permanent; exposed = hidden, prune reveals)
+        (!applies_now, applies_now)
+    }
+
+    /// GROUND-TRUTH prune-safety detector (DEBUG, gated on `CAYENNE_WATERMARK_AUDIT`).
+    ///
+    /// Runs immediately BEFORE the deletion-index prune at/below `T = prefix_cutoff`
+    /// and answers the one question that matters for the resurrection bug: will
+    /// pruning the `<= T` tombstones make any currently-HIDDEN, physically-present
+    /// row visible again?
+    ///
+    /// Unlike [`Self::bake_clean_prefix_holds`] — which TRUSTS each snapshot's
+    /// stored watermark and its manifest `min_sequence` — this SCANS every live
+    /// snapshot's physical PK rows and classifies each `<= T` tombstone over a
+    /// present row via [`Self::classify_prune_effect`] against the live (pre-prune)
+    /// deletion index, into two distinct-key tallies:
+    ///   - **cemented** — the row is ALREADY shown despite a real delete (the
+    ///     snapshot's over-claimed watermark exempts the tombstone); the prune
+    ///     destroys the tombstone that could reconcile it → PERMANENT over-count.
+    ///     This is the confirmed bug's signature; its count should track the
+    ///     checkpoint `actual − expected`.
+    ///   - **exposed** — the row is hidden now and the prune flips it visible.
+    /// Counts are de-duplicated by PK across snapshots (a key shown by several
+    /// snapshots is one over-counted row). A non-zero `cemented` total with
+    /// `would_prune = true` is the smoking gun.
+    ///
+    /// Live set mirrors the gate: current snapshot ∪ protected snapshots NOT in
+    /// `selected_set`. The merged output M is NOT scanned — it is stamped
+    /// `fence_max_delete_seq >= T`, so every `<= T` tombstone is already
+    /// watermark-exempt in M (any such row is visible pre-prune, independent of
+    /// the prune), so M cannot contribute a prune-CAUSED resurrection. The merged
+    /// inputs are retired post-swap and drop out.
+    async fn audit_prune_resurrection(
+        &self,
+        selected_set: &std::collections::HashSet<String>,
+        prefix_cutoff: i64,
+        would_prune: bool,
+    ) {
+        let Ok(Some(pk_indices)) = self.primary_key_indices() else {
+            return;
+        };
+        let converter = match self.build_pk_converter(&pk_indices) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    %e,
+                    "prune audit: failed to build PK converter; skipping"
+                );
+                return;
+            }
+        };
+        // Pre-prune deletion index — the same state the prune will operate on.
+        let deletion_snapshot = self.pk_deletion_snapshot();
+
+        let current_snapshot_id = self.get_current_snapshot_id();
+        let protected = self.protected_snapshots.load();
+        // (snapshot_id, read_watermark): None = current snapshot (all deletions apply).
+        let mut live: Vec<(String, Option<i64>)> = protected
+            .iter()
+            .filter(|(id, _)| !selected_set.contains(*id))
+            .map(|(id, w)| (id.clone(), Some(*w)))
+            .collect();
+        live.push((current_snapshot_id.clone(), None));
+
+        let ctx = self.create_session_context();
+        let pk_projection = pk_indices.clone();
+        let projected_pk_indices: Vec<usize> = (0..pk_indices.len()).collect();
+
+        // Distinct over-counted/affected PKs across all live snapshots (a key
+        // shown by several snapshots is ONE over-counted row).
+        let mut cemented_keys: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        let mut exposed_keys: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        let mut total_sample: Vec<String> = Vec::new();
+
+        for (snapshot_id, watermark) in &live {
+            let scan_plan = match self
+                .create_snapshot_scan_plan(&ctx.state(), snapshot_id, Some(&pk_projection), &[], None)
+                .await
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "cayenne::compaction",
+                        snapshot = snapshot_id.as_str(),
+                        %e,
+                        "prune audit: scan plan failed; skipping snapshot"
+                    );
+                    continue;
+                }
+            };
+            let mut stream =
+                match datafusion_physical_plan::execute_stream(scan_plan, ctx.task_ctx()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "cayenne::compaction",
+                            snapshot = snapshot_id.as_str(),
+                            %e,
+                            "prune audit: execute_stream failed; skipping snapshot"
+                        );
+                        continue;
+                    }
+                };
+
+            let mut snap_cemented: u64 = 0;
+            let mut snap_exposed: u64 = 0;
+            let mut snap_sample: Vec<String> = Vec::new();
+
+            while let Some(batch) = stream.next().await {
+                let batch = match batch {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "cayenne::compaction",
+                            snapshot = snapshot_id.as_str(),
+                            %e,
+                            "prune audit: batch error; partial scan for this snapshot"
+                        );
+                        break;
+                    }
+                };
+                match &deletion_snapshot {
+                    PkDeletionSnapshot::Int64Pk { tombstones } => {
+                        let Some(pk_array) = batch
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<arrow::array::Int64Array>()
+                        else {
+                            continue;
+                        };
+                        for row_idx in 0..batch.num_rows() {
+                            if pk_array.is_null(row_idx) {
+                                continue;
+                            }
+                            let pk = pk_array.value(row_idx);
+                            if let Some(t) = tombstones.get(pk) {
+                                let (cemented, exposed) =
+                                    Self::classify_prune_effect(&t, *watermark, prefix_cutoff);
+                                if cemented {
+                                    snap_cemented += 1;
+                                    cemented_keys.insert(pk.to_le_bytes().to_vec());
+                                    if snap_sample.len() < 10 {
+                                        snap_sample.push(pk.to_string());
+                                    }
+                                } else if exposed {
+                                    snap_exposed += 1;
+                                    exposed_keys.insert(pk.to_le_bytes().to_vec());
+                                }
+                            }
+                        }
+                    }
+                    PkDeletionSnapshot::RowConverterBased { tombstones } => {
+                        let pk_columns: Vec<_> = projected_pk_indices
+                            .iter()
+                            .map(|i| Arc::clone(batch.column(*i)))
+                            .collect();
+                        let rows = match converter.convert_columns(&pk_columns) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                tracing::warn!(
+                                    target: "cayenne::compaction",
+                                    %e,
+                                    "prune audit: convert_columns failed; skipping batch"
+                                );
+                                continue;
+                            }
+                        };
+                        for row_idx in 0..batch.num_rows() {
+                            let key = rows.row(row_idx);
+                            if let Some(t) = tombstones.get(key.as_ref()) {
+                                let (cemented, exposed) =
+                                    Self::classify_prune_effect(&t, *watermark, prefix_cutoff);
+                                if cemented {
+                                    snap_cemented += 1;
+                                    cemented_keys.insert(key.as_ref().to_vec());
+                                    if snap_sample.len() < 10 {
+                                        snap_sample.push(format!("{:?}", key.as_ref()));
+                                    }
+                                } else if exposed {
+                                    snap_exposed += 1;
+                                    exposed_keys.insert(key.as_ref().to_vec());
+                                }
+                            }
+                        }
+                    }
+                    PkDeletionSnapshot::PositionBased => return,
+                }
+            }
+
+            if snap_cemented > 0 || snap_exposed > 0 {
+                tracing::warn!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    snapshot = &snapshot_id[..snapshot_id.len().min(13)],
+                    is_current = watermark.is_none(),
+                    watermark = watermark.unwrap_or(-1),
+                    prefix_cutoff,
+                    would_prune,
+                    cemented = snap_cemented,
+                    exposed = snap_exposed,
+                    sample_pks = ?snap_sample,
+                    "PRUNE-UNSAFE: live snapshot holds deleted rows the prune permanently cements \
+                     (cemented = shown-despite-delete via over-claimed watermark) or exposes"
+                );
+                if total_sample.len() < 20 {
+                    let room = 20 - total_sample.len();
+                    total_sample.extend(snap_sample.into_iter().take(room));
                 }
             }
         }
-        (true, None)
+
+        if !cemented_keys.is_empty() || !exposed_keys.is_empty() {
+            tracing::error!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                prefix_cutoff,
+                would_prune,
+                cemented_distinct = cemented_keys.len(),
+                exposed_distinct = exposed_keys.len(),
+                live_snapshots = live.len(),
+                sample_pks = ?total_sample,
+                "PRUNE-UNSAFE TOTAL: prune at/below T affects present deleted rows. \
+                 cemented = over-counted NOW (shown via over-claimed watermark) and made \
+                 PERMANENT by destroying their tombstones; exposed = hidden now, revealed by \
+                 the prune. cemented_distinct should track checkpoint actual-minus-expected."
+            );
+        } else {
+            tracing::info!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                prefix_cutoff,
+                would_prune,
+                live_snapshots = live.len(),
+                "Prune audit clean: no present deleted row is cemented or exposed by the <= T prune"
+            );
+        }
+    }
+
+    /// DEBUG: collect the set of currently-VISIBLE primary keys via the REAL
+    /// merge-on-read scan (`self.scan`) — the same path queries use, so it unions
+    /// the listing table, ALL protected snapshots (including a freshly-swapped
+    /// merged output), the inline tier, and the mem-tier, minus the live deletion
+    /// view. Returns `None` on any error (best-effort; the audit just skips).
+    ///
+    /// Keys are encoded to `Vec<u8>` so both strategies share one set:
+    /// `Int64Pk` → little-endian 8 bytes; `RowConverterBased` → the row-converter
+    /// key bytes. Used by [`Self::audit_prune_visibility_delta`] to diff the
+    /// visible set across a prune with NO per-snapshot coverage gap.
+    async fn scan_visible_pk_set(&self) -> Option<std::collections::HashSet<Vec<u8>>> {
+        let pk_indices = self.primary_key_indices().ok()??;
+        let ctx = self.create_session_context();
+        let pk_projection = pk_indices.clone();
+        let plan = self
+            .scan(&ctx.state(), Some(&pk_projection), &[], None)
+            .await
+            .ok()?;
+        let mut stream = datafusion_physical_plan::execute_stream(plan, ctx.task_ctx()).ok()?;
+        let single_int64 = self.pk_deletion_strategy.is_int64_pk() && pk_indices.len() == 1;
+        let converter = self.build_pk_converter(&pk_indices).ok()?;
+        // After projection the PK columns sit at 0..pk_indices.len().
+        let projected: Vec<usize> = (0..pk_indices.len()).collect();
+        let mut set: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        while let Some(batch) = stream.next().await {
+            let batch = batch.ok()?;
+            if single_int64 {
+                let arr = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int64Array>()?;
+                for i in 0..batch.num_rows() {
+                    if !arr.is_null(i) {
+                        set.insert(arr.value(i).to_le_bytes().to_vec());
+                    }
+                }
+            } else {
+                let cols: Vec<_> = projected.iter().map(|j| Arc::clone(batch.column(*j))).collect();
+                let rows = converter.convert_columns(&cols).ok()?;
+                for i in 0..batch.num_rows() {
+                    set.insert(rows.row(i).as_ref().to_vec());
+                }
+            }
+        }
+        Some(set)
+    }
+
+    /// Did `key` (encoded as in [`Self::scan_visible_pk_set`]) carry a tombstone in
+    /// the PRE-prune `deletion_snapshot` that the `<= cutoff` prune removed — i.e.
+    /// a real (not re-inserted) delete with `delete_seq <= cutoff`? Used to
+    /// attribute a hidden→visible flip specifically to the prune (vs a concurrent
+    /// re-insert).
+    fn key_had_pruned_tombstone(
+        deletion_snapshot: &PkDeletionSnapshot,
+        key: &[u8],
+        cutoff: i64,
+    ) -> bool {
+        let real_and_pruned = |t: Tombstone| {
+            let reinserted = t.insert_sequence.is_some_and(|i| i > t.delete_sequence);
+            !reinserted && t.delete_sequence <= cutoff
+        };
+        match deletion_snapshot {
+            PkDeletionSnapshot::Int64Pk { tombstones } => {
+                let Ok(bytes) = <[u8; 8]>::try_from(key) else {
+                    return false;
+                };
+                tombstones
+                    .get(i64::from_le_bytes(bytes))
+                    .is_some_and(real_and_pruned)
+            }
+            PkDeletionSnapshot::RowConverterBased { tombstones } => {
+                tombstones.get(key).is_some_and(real_and_pruned)
+            }
+            PkDeletionSnapshot::PositionBased => false,
+        }
+    }
+
+    /// DEBUG (CAYENNE_WATERMARK_AUDIT): the DECISIVE prune-effect probe. Given the
+    /// visible PK set captured BEFORE the swap+prune (`visible_before`) and the
+    /// PRE-prune `deletion_snapshot`, re-scan the visible set AFTER and report:
+    ///   - `prune_resurrected` — keys that flipped hidden→visible AND had a `<= T`
+    ///     tombstone removed by the prune. THIS is the prune's damage, measured
+    ///     over the real read path with no coverage gap. A non-zero value with
+    ///     `would_prune=true` is the proof; it should track checkpoint
+    ///     `actual − expected`.
+    ///   - `other_newly_visible` — flips WITHOUT a pruned tombstone (concurrent
+    ///     re-inserts, or the merged-output swap exposing rows) — logged for
+    ///     context, not attributed to the prune.
+    ///   - the raw `visible_before` / `visible_after` counts and their delta.
+    async fn audit_prune_visibility_delta(
+        &self,
+        visible_before: std::collections::HashSet<Vec<u8>>,
+        deletion_snapshot: &PkDeletionSnapshot,
+        prefix_cutoff: i64,
+        would_prune: bool,
+    ) {
+        let Some(visible_after) = self.scan_visible_pk_set().await else {
+            tracing::warn!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                "prune visibility audit: post-prune scan failed; skipping delta"
+            );
+            return;
+        };
+        let mut prune_resurrected: u64 = 0;
+        let mut other_newly_visible: u64 = 0;
+        let mut sample: Vec<String> = Vec::new();
+        for key in visible_after.difference(&visible_before) {
+            if Self::key_had_pruned_tombstone(deletion_snapshot, key, prefix_cutoff) {
+                prune_resurrected += 1;
+                if sample.len() < 20 {
+                    sample.push(Self::format_pk_key(key));
+                }
+            } else {
+                other_newly_visible += 1;
+            }
+        }
+        let count_delta = visible_after.len() as i64 - visible_before.len() as i64;
+        if prune_resurrected > 0 {
+            tracing::error!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                prefix_cutoff,
+                would_prune,
+                prune_resurrected,
+                other_newly_visible,
+                visible_before = visible_before.len(),
+                visible_after = visible_after.len(),
+                count_delta,
+                sample_pks = ?sample,
+                "PRUNE-RESURRECT: keys flipped hidden->visible across the prune AND had a <= T \
+                 tombstone removed — the prune resurrected them (measured over the real \
+                 merge-on-read scan). prune_resurrected should track checkpoint actual-minus-expected."
+            );
+        } else {
+            tracing::info!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                prefix_cutoff,
+                would_prune,
+                other_newly_visible,
+                visible_before = visible_before.len(),
+                visible_after = visible_after.len(),
+                count_delta,
+                "Prune visibility audit clean: no key flipped hidden->visible due to a pruned tombstone"
+            );
+        }
+    }
+
+    /// Human-readable rendering of a PK key encoded by [`Self::scan_visible_pk_set`]
+    /// (8-byte LE int64 → the integer; otherwise hex of the row-converter bytes).
+    fn format_pk_key(key: &[u8]) -> String {
+        if let Ok(bytes) = <[u8; 8]>::try_from(key) {
+            i64::from_le_bytes(bytes).to_string()
+        } else {
+            key.iter().map(|b| format!("{b:02x}")).collect()
+        }
     }
 
     async fn bake_seq_prefix_protected_snapshots(&self) -> Result<bool> {
@@ -12954,6 +13573,11 @@ impl CayenneTableProvider {
         } else {
             UnionExec::try_new(plans)?
         };
+        // DEBUG: keep a handle so we can read the deletion filter's `rows_deleted`
+        // metric AFTER the rewrite runs — the rows the bake PHYSICALLY removed.
+        // Compared against the prune's `tombstones_pruned`, this proves whether the
+        // prune dropped more tombstones than the rewrite applied (the delete leak).
+        let metrics_plan = Arc::clone(&merged_plan);
         let stream = datafusion_physical_plan::execute_stream(merged_plan, state.task_ctx())?;
 
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
@@ -12998,6 +13622,15 @@ impl CayenneTableProvider {
                 return Err(e);
             }
         };
+        // Rows the rewrite's deletion filter actually removed (summed across the
+        // per-snapshot filter execs). `rows_deleted_by_filter < tombstones_pruned`
+        // below means the prune dropped tombstones for rows that were never baked
+        // out → those rows resurrect (the CDC delete-loss bug).
+        let rows_deleted_by_filter = sum_plan_metric(&metrics_plan, "rows_deleted");
+        // Rows the rewrite KEPT despite an input threshold suppressing their
+        // tombstone — an over-claim propagated into this baked output (should be 0).
+        let rows_resurrected_during_rewrite =
+            sum_plan_metric(&metrics_plan, "resurrected_by_threshold");
 
         if !is_s3 {
             let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
@@ -13086,6 +13719,31 @@ impl CayenneTableProvider {
             .bake_clean_prefix_holds(&selected_set, prefix_cutoff)
             .await;
 
+        // GROUND-TRUTH prune-safety check (DEBUG, CAYENNE_WATERMARK_AUDIT): scan
+        // the live snapshots' physical rows and replay the read-path visibility
+        // decision against the pre-prune deletion index, so we can SEE whether the
+        // prune we are about to (not) run resurrects any currently-hidden row —
+        // independent of whether the (heuristic) gate trusts the watermark. Runs
+        // OUTSIDE the write fence (it does scan I/O); the prune itself is in-memory
+        // under the fence below. `would_prune` records whether the prune will
+        // actually fire this pass (gate clean AND not kill-switched).
+        let would_prune = clean_prefix_holds && !tombstone_prune_disabled();
+        // DEBUG (CAYENNE_WATERMARK_AUDIT): two complementary prune audits.
+        //   (1) per-snapshot ground-truth (`audit_prune_resurrection`), and
+        //   (2) the DECISIVE before/after VISIBLE-SET diff over the real
+        //       merge-on-read scan — capture the visible PK set NOW (pre-swap,
+        //       pre-prune); after the swap+prune we re-scan and diff (see
+        //       `audit_prune_visibility_delta`). Because it uses `self.scan`, it
+        //       covers the merged output M, the current snapshot, every protected
+        //       snapshot, and the inline/mem tiers — no per-snapshot coverage gap.
+        let prune_audit_before = if watermark_audit_enabled() {
+            self.audit_prune_resurrection(&selected_set, prefix_cutoff, would_prune)
+                .await;
+            self.scan_visible_pk_set().await
+        } else {
+            None
+        };
+
         // Publish the protected-set swap AND (when the clean-prefix invariant holds)
         // the deletion-index prune together under ONE write-fence hold, so a scan
         // never observes a torn state (swapped-but-not-pruned, or vice versa). Only
@@ -13100,9 +13758,15 @@ impl CayenneTableProvider {
                 new_map.insert(new_snapshot_id.clone(), fence_max_delete_seq);
                 Arc::new(new_map)
             });
-            if clean_prefix_holds {
+            if clean_prefix_holds && !tombstone_prune_disabled() {
                 self.prune_deletion_index_at_or_below(prefix_cutoff);
             }
+        }
+
+        // (2) post-prune half of the visible-set diff: what flipped hidden->visible.
+        if let Some(before) = prune_audit_before {
+            self.audit_prune_visibility_delta(before, &deletion_snapshot, prefix_cutoff, would_prune)
+                .await;
         }
 
         if clean_prefix_holds {
@@ -13111,8 +13775,11 @@ impl CayenneTableProvider {
                 table = self.table_metadata.table_name.as_str(),
                 merged_inputs = selected.len(),
                 rows = total_rows,
+                rows_deleted_by_filter,
+                rows_resurrected_during_rewrite,
                 new_snapshot_id = new_snapshot_id.as_str(),
                 prefix_cutoff,
+                fence_max_delete_seq,
                 duration_ms = compaction_start.elapsed().as_millis(),
                 "Seq-prefix bake completed; pruned deletion index at or below T"
             );
@@ -13130,6 +13797,12 @@ impl CayenneTableProvider {
                  Pruning would risk resurrecting a deleted row; the index is left intact."
             );
         }
+
+        // DEBUG: audit the merged OUTPUT against the watermark (fence) stamped on
+        // it — runs whether or not the prune held, since the output snapshot is
+        // published in both branches.
+        self.audit_watermark_honesty(&new_snapshot_id, fence_max_delete_seq, "seq_prefix_bake")
+            .await;
 
         // Retire the merged-away inputs (whole-dir, event-anchored) and sweep
         // aged-out retirements — identical to the size-tier path.
@@ -13348,6 +14021,109 @@ impl CayenneTableProvider {
         let runtime_env = super::compaction::compaction_runtime_env()
             .unwrap_or_else(|| Arc::clone(self.context.runtime_env()));
         SessionContext::new_with_config_rt(SessionConfig::default(), runtime_env)
+    }
+
+    /// DEBUG (gated by `CAYENNE_WATERMARK_AUDIT`): verify a freshly-stamped
+    /// snapshot is HONEST about its `watermark`. A snapshot stamped watermark `W`
+    /// promises every row deletable by a tombstone with `delete_seq <= W` (and no
+    /// valid re-insert) has been physically removed.
+    ///
+    /// We scan the snapshot ONCE applying the deletion filter at
+    /// `min_delete_seq_to_apply = W` and read the filter's `resurrected_by_threshold`
+    /// metric. That metric counts rows kept whose tombstone is `delete_seq <= W`
+    /// AND has no valid re-insert (`insert_seq > delete_seq`) — i.e. rows that
+    /// SHOULD be deleted but survive only because the watermark suppresses their
+    /// tombstone. Crucially it EXCLUDES re-inserted (upsert) rows, so it does not
+    /// false-positive on the common update path. Any nonzero value is a genuine
+    /// over-claim, attributed to `origin` (fast_subset / seq_prefix_bake).
+    ///
+    /// The filter is force-built here (not via `apply_partial_deletion_filter`)
+    /// precisely so the `max_seq <= W` short-circuit can't suppress the metric in
+    /// the common case where the audit runs immediately after stamping and the
+    /// live deletion index's max delete seq still equals `W`.
+    async fn audit_watermark_honesty(&self, snapshot_id: &str, watermark: i64, origin: &str) {
+        if !watermark_audit_enabled() || self.pk_deletion_strategy.is_position_based() {
+            return;
+        }
+        let ctx = self.create_compaction_session_context();
+        let state = ctx.state();
+        let Ok(plan) = self
+            .create_snapshot_scan_plan(&state, snapshot_id, None, &[], None)
+            .await
+        else {
+            return;
+        };
+        // Force-build the deletion filter at min=watermark (do NOT use
+        // apply_partial_deletion_filter — its `max_seq <= min` short-circuit would
+        // skip the filter, and hence the `resurrected_by_threshold` metric, exactly
+        // when the audit runs right after stamping and `max_seq == watermark`).
+        let deletion_snapshot = self.pk_deletion_snapshot();
+        let filtered: Arc<dyn ExecutionPlan> = match &deletion_snapshot {
+            PkDeletionSnapshot::Int64Pk { tombstones } => {
+                if !tombstones.has_deletions() {
+                    return;
+                }
+                let Some(pk_col) = self.pk_column_indices.first().copied() else {
+                    return;
+                };
+                Arc::new(Int64PkDeletionFilterExec::new(
+                    plan,
+                    Arc::clone(tombstones),
+                    InsertRecordHandling::Ignore,
+                    pk_col,
+                    Some(watermark),
+                ))
+            }
+            PkDeletionSnapshot::RowConverterBased { tombstones } => {
+                let Some(row_converter) = self.pk_row_converter.as_ref() else {
+                    return;
+                };
+                if !tombstones.has_deletions() {
+                    return;
+                }
+                Arc::new(KeyBasedDeletionFilterExec::new(
+                    plan,
+                    Arc::clone(tombstones),
+                    InsertRecordHandling::Ignore,
+                    self.pk_column_indices.clone(),
+                    Arc::clone(row_converter),
+                    Some(watermark),
+                ))
+            }
+            PkDeletionSnapshot::PositionBased => return,
+        };
+        let metrics_plan = Arc::clone(&filtered);
+        let Ok(mut stream) =
+            datafusion_physical_plan::execute_stream(filtered, state.task_ctx())
+        else {
+            return;
+        };
+        while let Some(batch) = stream.next().await {
+            if batch.is_err() {
+                return;
+            }
+        }
+        let resurrected = sum_plan_metric(&metrics_plan, "resurrected_by_threshold");
+        if resurrected > 0 {
+            tracing::warn!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                snapshot = snapshot_id,
+                origin,
+                watermark,
+                resurrected,
+                "WATERMARK MINT: snapshot stamped beyond what it baked — rows deletable at/below its watermark (no re-insert) survive the scan (over-claim minted/propagated here)"
+            );
+        } else {
+            tracing::debug!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                snapshot = snapshot_id,
+                origin,
+                watermark,
+                "Watermark audit: snapshot honest"
+            );
+        }
     }
 
     /// Wrap a plan with a `FilterExec` that enforces the retention filter.
@@ -13654,7 +14430,12 @@ impl CayenneTableProvider {
     /// public surface.
     #[doc(hidden)]
     pub fn prune_deletion_index_at_or_below(&self, cutoff: i64) {
-        match &self.pk_deletion_strategy {
+        // DEBUG: capture tombstone counts before/after so we can tell exactly how
+        // many deletions this prune dropped. The rewrite that ran just before is
+        // supposed to have physically removed every row whose tombstone we drop
+        // here; if `tombstones_pruned` exceeds the rows actually baked out, those
+        // rows resurrect at scan time (the CDC delete-loss bug).
+        let (before, after, retained_max_seq) = match &self.pk_deletion_strategy {
             PkDeletionStrategyWithCache::Int64Pk {
                 deletion_snapshot, ..
             } => {
@@ -13662,9 +14443,12 @@ impl CayenneTableProvider {
                 if !current.tombstones.has_deletions() {
                     return;
                 }
+                let before = current.tombstones.len();
                 let pruned = current.tombstones.prune_deletes_at_or_below(cutoff);
+                let (after, retained_max_seq) = (pruned.len(), pruned.max_sequence_number());
                 deletion_snapshot.store(Arc::new(Int64PkDeletionSnapshot::from_index(pruned)));
                 self.refresh_deletion_memory_accounting();
+                (before, after, retained_max_seq)
             }
             PkDeletionStrategyWithCache::RowConverterBased {
                 deletion_snapshot, ..
@@ -13673,22 +14457,30 @@ impl CayenneTableProvider {
                 if !current.tombstones.has_deletions() {
                     return;
                 }
+                let before = current.tombstones.len();
                 let pruned = current.tombstones.prune_deletes_at_or_below(cutoff);
+                let (after, retained_max_seq) = (pruned.len(), pruned.max_sequence_number());
                 deletion_snapshot.store(Arc::new(RowConverterDeletionSnapshot::from_index(pruned)));
                 self.refresh_deletion_memory_accounting();
+                (before, after, retained_max_seq)
             }
             PkDeletionStrategyWithCache::PositionBased { .. } => {
                 // Position deletions are file-scoped, not sequence-tagged; a
                 // seq-prefix bake of files leaves them to the file-level cleanup
                 // path, so there is nothing to prune by sequence here.
+                return;
             }
-        }
+        };
 
-        tracing::debug!(
+        tracing::info!(
+            target: "cayenne::compaction",
+            table = self.table_metadata.table_name.as_str(),
             cutoff,
-            "Pruned in-memory deletion index of tombstones at or below the \
-             seq-prefix cutoff for table {}",
-            self.table_metadata.table_name
+            tombstones_before = before,
+            tombstones_after = after,
+            tombstones_pruned = before.saturating_sub(after),
+            retained_max_delete_seq = retained_max_seq,
+            "Pruned in-memory deletion index at or below seq-prefix cutoff"
         );
     }
 
@@ -15777,6 +16569,17 @@ impl CayenneTableProvider {
                 self.table_name().to_string(),
             )],
         );
+        // DEBUG: how many delete keys this CDC batch absorbed into the RAM tier,
+        // and which mem-tier epoch they landed in. These tombstones fold into the
+        // deletion index at the next checkpoint; pair with the prune/bake logs to
+        // trace whether any are later dropped without their rows being baked out.
+        tracing::info!(
+            target: "cayenne::compaction",
+            table = self.table_name(),
+            delete_keys = key_count,
+            epoch,
+            "CDC delete keys absorbed into RAM tier",
+        );
         Ok(Some(epoch))
     }
 
@@ -16730,6 +17533,47 @@ impl CayenneTableProvider {
         } else {
             Vec::new()
         };
+
+        // INLINE-TIER DIAGNOSTIC (CAYENNE_WATERMARK_AUDIT only): capture the
+        // flushed row-keys for composite/string PK tables BEFORE `batches` is
+        // moved into the `MemorySource` below. The file-mode inline flush stamps
+        // the new snapshot with its own allocated `sequence_number` as the
+        // watermark but, unlike `checkpoint_mem_tier`, runs NO re-insert upgrade
+        // for `RowConverterBased` PKs (`upgrade_tombstones_for_flushed_pks` is
+        // `Int64Pk`-only). After the snapshot is written we probe the deletion
+        // index with these keys against that watermark to see whether the flush
+        // itself mints a resurrection — i.e. whether the bug is inline-tier
+        // related. Empty (and the probe skipped) when the audit is off.
+        let flushed_row_keys: Vec<Box<[u8]>> = if watermark_audit_enabled()
+            && matches!(
+                self.pk_deletion_strategy,
+                PkDeletionStrategyWithCache::RowConverterBased { .. }
+            )
+            && !self.pk_column_indices.is_empty()
+        {
+            match self.pk_row_converter.as_deref() {
+                Some(converter) => {
+                    let mut keys: Vec<Box<[u8]>> = Vec::with_capacity(total_rows);
+                    for batch in &batches {
+                        let pk_columns: Vec<_> = self
+                            .pk_column_indices
+                            .iter()
+                            .map(|idx| Arc::clone(batch.column(*idx)))
+                            .collect();
+                        if let Ok(rows) = converter.convert_columns(&pk_columns) {
+                            for i in 0..batch.num_rows() {
+                                keys.push(rows.row(i).as_ref().into());
+                            }
+                        }
+                    }
+                    keys
+                }
+                None => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+
         tracing::info!(
             "Checkpointing {} inlined rows ({} batches) for table {}",
             total_rows,
@@ -16788,6 +17632,68 @@ impl CayenneTableProvider {
                 // from the just-written checkpoint file.
                 self.upgrade_tombstones_for_flushed_pks(&flushed_int64_pks, sequence_number)
                     .await?;
+
+                // INLINE-TIER DIAGNOSTIC (CAYENNE_WATERMARK_AUDIT only): probe
+                // the deletion index with the flushed row-keys against the
+                // watermark (`sequence_number`) this snapshot is stamped with.
+                // A flushed PK that carries a delete-only tombstone with
+                // `delete_seq <= watermark` and no valid re-insert is one the new
+                // snapshot's filter treats as "already baked" and therefore KEEPS
+                // — a resurrection minted at the inline→file flush. The `Int64Pk`
+                // path repairs these via `upgrade_tombstones_for_flushed_pks`
+                // above; the `RowConverterBased` (string/composite PK) path does
+                // NOT — exactly the gap under investigation. A non-zero
+                // `flushed_resurrectable` here pins the bug to the inline tier;
+                // zero (with resurrections still seen at `origin=fast_subset`)
+                // exonerates the flush and points back at compaction's
+                // max-watermark merge.
+                if watermark_audit_enabled()
+                    && let PkDeletionStrategyWithCache::RowConverterBased {
+                        deletion_snapshot,
+                        ..
+                    } = &self.pk_deletion_strategy
+                {
+                    let snap = deletion_snapshot.load_full();
+                    let index = &snap.tombstones;
+                    let mut flushed_with_tombstone = 0usize;
+                    let mut flushed_resurrectable = 0usize;
+                    let mut samples = 0u32;
+                    for key in &flushed_row_keys {
+                        if let Some(t) = index.get(key) {
+                            flushed_with_tombstone += 1;
+                            let reinserted = t
+                                .insert_sequence
+                                .is_some_and(|ins| ins > t.delete_sequence);
+                            if t.delete_sequence <= sequence_number && !reinserted {
+                                flushed_resurrectable += 1;
+                                if samples < 20 {
+                                    samples += 1;
+                                    tracing::warn!(
+                                        target: "cayenne::inline_checkpoint",
+                                        delete_seq = t.delete_sequence,
+                                        insert_seq = ?t.insert_sequence,
+                                        flush_watermark = sequence_number,
+                                        "Inline flush resurrectable PK: flushed row carries delete-only tombstone (delete_seq <= flush watermark, no valid re-insert); string-PK flush applies no upgrade"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    tracing::warn!(
+                        target: "cayenne::inline_checkpoint",
+                        table = %self.table_metadata.table_name,
+                        flush_watermark = sequence_number,
+                        flushed_rows = total_rows,
+                        flushed_keys_probed = flushed_row_keys.len(),
+                        index_tombstones = index.len(),
+                        index_delete_entries = index.delete_len(),
+                        flushed_with_tombstone,
+                        flushed_resurrectable,
+                        pk_strategy = "RowConverterBased",
+                        reinsert_upgrade_applied = false,
+                        "Inline checkpoint flush census (string/composite PK, file mode): flushed_resurrectable>0 ⇒ resurrection minted at inline flush"
+                    );
+                }
                 stats
             };
 
@@ -20005,6 +20911,11 @@ fn format_bytes_per_sec(bytes_per_sec: f64) -> String {
 #[async_trait::async_trait]
 impl super::compaction::CompactionRunner for CayenneTableProvider {
     async fn run_compaction_trigger(&self) -> std::result::Result<bool, String> {
+        // DEBUG kill-switch: suppress BOTH the seq-prefix bake and the fast
+        // size-tier subset compaction (and the bake's deletion-index prune).
+        if compaction_disabled() {
+            return Ok(false);
+        }
         // Routes to the fast protected-snapshot subset compaction, which only
         // rewrites immutable protected snapshots and CAS-swaps them in the
         // catalog. Key-delete tables can run concurrently with appends because
@@ -30860,6 +31771,519 @@ mod tests {
             collect_id_value_pairs(&ctx, &provider, "pipelined_key_delete_overlap").await,
             vec![(1, 222)],
             "the later staged upsert wins; no resurface of 10 or 111, no vanish"
+        );
+    }
+
+    /// BOOTSTRAP-MODE CDC RESURRECTION REPRO (orders-like, string `_id` PK).
+    ///
+    /// Reproduces the spicebench checkpoint stall (`actual > expected` row count
+    /// — deleted rows reappear) entirely in-process: NO MongoDB, NO SF data
+    /// generation, NO CDC stream plumbing. The point of this test is to answer
+    /// "how do we make it work as CDC?" — a cayenne table IS a CDC table when
+    /// it's created with a primary key + `OnConflict::Upsert`; then the exact
+    /// provider entrypoints the runtime's CDC apply path uses
+    /// (`accelerated_table/refresh_task/changes.rs`) are:
+    ///   * CDC upsert (insert/update) → `write_cdc_append_stream(..).finish()`
+    ///   * CDC delete  (file mode)    → `delete_from(predicate)` + `collect`
+    ///   * checkpoint  (inline→Vortex) → `checkpoint_inlined_data()`
+    ///   * compaction  (fast subset)   → `maybe_compact_small_files()` /
+    ///                                    `compact_protected_snapshots_subset(MAX)`
+    ///
+    /// Mirrors `bootstrap` mode: seed a base corpus → snapshot (flush) → a long
+    /// run of rate-limited 80/20 upsert/delete mutations, interleaving flushes
+    /// and fast-subset compactions. A `BTreeMap` shadow set is the source of
+    /// truth; the test fails if any deleted `_id` resurfaces (or any live `_id`
+    /// vanishes / shows a stale value) after compaction — the live bug. Run with
+    /// `CAYENNE_WATERMARK_AUDIT=1` to also print the inline-flush census and
+    /// `Resurrected-row detail` lines that pin the mechanism.
+    ///
+    /// `#[ignore]`d because it is a deliberately-red repro harness while the bug
+    /// is live (and a tuning surface): run explicitly with
+    /// `CAYENNE_WATERMARK_AUDIT=1 cargo test -p cayenne cdc_bootstrap_orders_resurrection_repro -- --ignored --nocapture`.
+    #[test_log::test(tokio::test)]
+    #[ignore = "repro harness for the CDC delete-loss bug; run with --ignored"]
+    async fn cdc_bootstrap_orders_resurrection_repro() {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use datafusion_expr::lit;
+
+        // orders-like row: string `_id` PK (→ RowConverterBased, the SAME path as
+        // the mongo `_id` repro, the one with NO file-mode re-insert upgrade).
+        fn key(n: i64) -> String {
+            format!("ord-{n:08}")
+        }
+
+        let ctx = SessionContext::new();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str path"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str path"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog created"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_id", DataType::Utf8, false),
+            Field::new("o_orderkey", DataType::Int64, false),
+            Field::new("o_totalprice", DataType::Int64, false),
+        ]));
+
+        const TRIGGER: usize = 4;
+        let options = CreateTableOptions {
+            table_name: "orders".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec!["_id".to_string()],
+            on_conflict: Some(OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "_id".to_string(),
+                ]),
+            )),
+            base_path: data_dir,
+            partition_column: None,
+            vortex_config: VortexConfig {
+                // File mode = the user's repro AND the inline-tier flush path
+                // under investigation. Memory mode would route deletes through
+                // `checkpoint_mem_tier`, which DOES handle keyed re-inserts.
+                cdc_durability: crate::metadata::CdcDurability::File,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                // Small but non-zero so the inline tier IS exercised and each
+                // checkpoint flushes a fresh (climbing-watermark) snapshot.
+                inline_max_rows: 64,
+                // Keep the seq-prefix BAKE OFF so durable tombstones ACCUMULATE
+                // and the fast-subset merge runs OVER un-baked deletes — the
+                // `origin=fast_subset` over-claim path. (Baking every round, e.g.
+                // trigger=1, drains the index before fast-subset sees it →
+                // `fence_max_delete_seq=0` → nothing to over-claim.)
+                bake_deletion_index_trigger: 1_000_000,
+                // Low floor so a handful of snapshots merge on each trigger.
+                compaction_trigger_protected_snapshots: TRIGGER,
+                // Pin background tasks off so nothing races the explicit drives.
+                compaction_background_interval_ms: 3_600_000,
+                cdc_mem_tier_checkpoint_interval_ms: 0,
+                ..VortexConfig::default()
+            },
+        };
+        let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
+            .create(options)
+            .await
+            .expect("table created");
+
+        // CDC upsert helper: stage via the real CDC append path, then finalize
+        // the pipelined publish (exactly what the runtime does per sub-batch).
+        let upsert = |id: String, v: i64| {
+            let provider = &provider;
+            let ctx = &ctx;
+            let schema = Arc::clone(&schema);
+            async move {
+                let ids = StringArray::from(vec![id.as_str()]);
+                let orderkey = id.trim_start_matches("ord-").parse::<i64>().unwrap_or(0);
+                let batch = RecordBatch::try_new(
+                    schema,
+                    vec![
+                        Arc::new(ids),
+                        Arc::new(Int64Array::from(vec![orderkey])),
+                        Arc::new(Int64Array::from(vec![v])),
+                    ],
+                )
+                .expect("orders batch is valid");
+                let w = provider
+                    .write_cdc_append_stream(single_batch_stream(batch), &ctx.task_ctx())
+                    .await
+                    .expect("cdc upsert");
+                if w.has_pending_finalize() {
+                    w.finish().await.expect("cdc upsert finalize");
+                }
+            }
+        };
+
+        // Shadow set: the authoritative expected live `_id -> o_totalprice`.
+        let mut shadow: std::collections::BTreeMap<String, i64> =
+            std::collections::BTreeMap::new();
+
+        // ---- (1) SEED the base corpus, flushing several small snapshots so the
+        // base rows live in fast-subset-mergeable snapshots (not one big file).
+        const BASE: i64 = 2_000;
+        let mut next_value: i64 = BASE; // monotone payloads for updates/re-inserts
+        for n in 0..BASE {
+            upsert(key(n), n).await;
+            shadow.insert(key(n), n);
+            if (n + 1) % 200 == 0 {
+                provider
+                    .checkpoint_inlined_data()
+                    .await
+                    .expect("seed checkpoint");
+            }
+        }
+        provider
+            .checkpoint_inlined_data()
+            .await
+            .expect("seed final checkpoint");
+
+        // ---- (2) rate-limited 80/20 mutation rounds. Deterministic xorshift64*
+        // PRNG (fixed seed) so any failure reproduces byte-for-byte.
+        let mut rng_state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next_rand = move || {
+            rng_state ^= rng_state >> 12;
+            rng_state ^= rng_state << 25;
+            rng_state ^= rng_state >> 27;
+            rng_state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        };
+
+        const ROUNDS: usize = 40;
+        const PER_ROUND: usize = 50;
+        // Brand-new keys live ABOVE the base range so they never collide with the
+        // base-file rows the deletes target.
+        let mut new_key_id: i64 = BASE;
+        for _round in 0..ROUNDS {
+            for _ in 0..PER_ROUND {
+                let roll = next_rand() % 100;
+                if roll < 30 {
+                    // DELETE a base key that is STILL resident in the durable seed
+                    // files (never re-inserted) → a durable `KeyDeletionIndex`
+                    // tombstone OVER A FILE ROW. This is the condition the real
+                    // SF-base run hits and that my first version missed: deleting
+                    // a recently-upserted (still-inline) key only writes an inline
+                    // tombstone, so the fast-subset merge never sees a durable
+                    // delete to over-claim (`fence_max_delete_seq=0`).
+                    let mut victim = None;
+                    for _try in 0..8 {
+                        let pick = (next_rand() % BASE as u64) as i64;
+                        let k = key(pick);
+                        if shadow.contains_key(&k) {
+                            victim = Some(k);
+                            break;
+                        }
+                    }
+                    if let Some(victim) = victim {
+                        let plan = provider
+                            .delete_from(&ctx.state(), vec![col("_id").eq(lit(victim.as_str()))])
+                            .await
+                            .expect("delete plan");
+                        collect(plan, ctx.task_ctx())
+                            .await
+                            .expect("delete executed");
+                        shadow.remove(&victim);
+                    }
+                } else {
+                    // UPSERT a brand-new key (above the base range) → inline →
+                    // flushed as a climbing-watermark snapshot that compaction then
+                    // merges OVER the low-watermark base files carrying the
+                    // not-yet-baked deleted rows.
+                    let id = key(new_key_id);
+                    new_key_id += 1;
+                    next_value += 1;
+                    upsert(id.clone(), next_value).await;
+                    shadow.insert(id, next_value);
+                }
+            }
+            // Flush this round (climbing watermark) and run the real maintenance
+            // compaction trigger (subset / bake per its own thresholds).
+            provider
+                .checkpoint_inlined_data()
+                .await
+                .expect("round checkpoint");
+            // Drive the REAL CDC maintenance path each round — the seq-prefix
+            // BAKE (prunes the deletion index) THEN the size-tier subset merge —
+            // exactly what `schedule_post_write_compaction` runs in production.
+            // (`maybe_compact_small_files` only does within-snapshot file
+            // compaction and never touches the protected-snapshot tier.)
+            provider
+                .run_compaction_trigger()
+                .await
+                .expect("round compaction trigger");
+        }
+
+        // Final flush, then drain the real maintenance path so the bake + subset
+        // fully settle into the merged Vortex tier (where resurrection surfaces).
+        provider
+            .checkpoint_inlined_data()
+            .await
+            .expect("final checkpoint");
+        for _ in 0..3 {
+            provider
+                .run_compaction_trigger()
+                .await
+                .expect("final compaction trigger");
+        }
+
+        // ---- (3) verify: scanned rows must EXACTLY equal the shadow set.
+        let batches = read_all(&ctx, &provider, "orders").await;
+        let mut actual: std::collections::BTreeMap<String, i64> =
+            std::collections::BTreeMap::new();
+        for batch in &batches {
+            let id_idx = batch.schema().index_of("_id").expect("_id column");
+            let price_idx = batch
+                .schema()
+                .index_of("o_totalprice")
+                .expect("price column");
+            let ids = batch
+                .column(id_idx)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("_id is Utf8");
+            let prices = batch
+                .column(price_idx)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("price is Int64");
+            for row in 0..batch.num_rows() {
+                let prev = actual.insert(ids.value(row).to_string(), prices.value(row));
+                assert!(
+                    prev.is_none(),
+                    "duplicate _id {} in scan output (compaction produced two live versions)",
+                    ids.value(row)
+                );
+            }
+        }
+
+        // The live bug: deleted keys reappear → `actual` is a SUPERSET of
+        // `shadow` (`actual_live > expected_live`, the spicebench symptom).
+        let resurrected: Vec<String> = actual
+            .keys()
+            .filter(|k| !shadow.contains_key(*k))
+            .cloned()
+            .collect();
+        let vanished: Vec<String> = shadow
+            .keys()
+            .filter(|k| !actual.contains_key(*k))
+            .cloned()
+            .collect();
+        let stale: Vec<String> = actual
+            .iter()
+            .filter(|(k, v)| shadow.get(*k).is_some_and(|exp| exp != *v))
+            .map(|(k, _)| k.clone())
+            .collect();
+
+        assert!(
+            resurrected.is_empty() && vanished.is_empty() && stale.is_empty(),
+            "CDC row set diverged after compaction: expected_live={}, actual_live={}; \
+             {} resurrected (deleted rows reappeared), {} vanished, {} stale-value. \
+             sample resurrected={:?}",
+            shadow.len(),
+            actual.len(),
+            resurrected.len(),
+            vanished.len(),
+            stale.len(),
+            resurrected.iter().take(10).collect::<Vec<_>>(),
+        );
+    }
+
+    /// STRUCTURED CDC RESURRECTION PROBE (string `_id` PK): drives the exact
+    /// insert → flush → delete → re-insert → flush → BAKE sequence by hand,
+    /// instead of a random workload, to deterministically target the
+    /// inline-flush string-PK gap (`upgrade_tombstones_for_flushed_pks` is
+    /// `Int64Pk`-only) interacting with the seq-prefix bake's tombstone prune.
+    ///
+    /// Three key cohorts after the bake:
+    ///   * `k0..k24`  deleted THEN re-inserted (new value) — must show the NEW
+    ///     value exactly once (no duplicate, no stale value, no vanish),
+    ///   * `k25..k49` deleted and NOT re-inserted — must stay GONE (the
+    ///     resurrection symptom is these reappearing → `actual > expected`),
+    ///   * `k50..k99` untouched — must survive.
+    ///
+    /// `#[ignore]`d like the workload repro; run with
+    /// `CAYENNE_WATERMARK_AUDIT=1 RUST_LOG=cayenne=debug cargo test -p cayenne cdc_string_pk_reinsert_bake_probe -- --ignored --nocapture`.
+    #[test_log::test(tokio::test)]
+    #[ignore = "repro harness for the CDC delete-loss bug; run with --ignored"]
+    async fn cdc_string_pk_reinsert_bake_probe() {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use datafusion_expr::lit;
+
+        fn k(n: i64) -> String {
+            format!("k-{n:05}")
+        }
+
+        let ctx = SessionContext::new();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str path"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str path"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog created"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_id", DataType::Utf8, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let options = CreateTableOptions {
+            table_name: "orders".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec!["_id".to_string()],
+            on_conflict: Some(OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "_id".to_string(),
+                ]),
+            )),
+            base_path: data_dir,
+            partition_column: None,
+            vortex_config: VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::File,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 64,
+                // Bake fires on any tombstone so the prune path is exercised.
+                bake_deletion_index_trigger: 1,
+                compaction_trigger_protected_snapshots: 2,
+                compaction_background_interval_ms: 3_600_000,
+                cdc_mem_tier_checkpoint_interval_ms: 0,
+                ..VortexConfig::default()
+            },
+        };
+        let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
+            .create(options)
+            .await
+            .expect("table created");
+
+        let upsert = |id: String, v: i64| {
+            let provider = &provider;
+            let ctx = &ctx;
+            let schema = Arc::clone(&schema);
+            async move {
+                let batch = RecordBatch::try_new(
+                    schema,
+                    vec![
+                        Arc::new(StringArray::from(vec![id.as_str()])),
+                        Arc::new(Int64Array::from(vec![v])),
+                    ],
+                )
+                .expect("batch is valid");
+                let w = provider
+                    .write_cdc_append_stream(single_batch_stream(batch), &ctx.task_ctx())
+                    .await
+                    .expect("cdc upsert");
+                if w.has_pending_finalize() {
+                    w.finish().await.expect("cdc upsert finalize");
+                }
+            }
+        };
+        let delete_one = |id: String| {
+            let provider = &provider;
+            let ctx = &ctx;
+            async move {
+                let plan = provider
+                    .delete_from(&ctx.state(), vec![col("_id").eq(lit(id.as_str()))])
+                    .await
+                    .expect("delete plan");
+                collect(plan, ctx.task_ctx())
+                    .await
+                    .expect("delete executed");
+            }
+        };
+
+        let mut expected: std::collections::BTreeMap<String, i64> =
+            std::collections::BTreeMap::new();
+
+        // (1) Seed k0..k99 in small flushed chunks → several low-watermark
+        // file-backed snapshots that the bake's older prefix will cover.
+        for chunk in 0..5 {
+            for i in (chunk * 20)..(chunk * 20 + 20) {
+                upsert(k(i), i).await;
+                expected.insert(k(i), i);
+            }
+            provider
+                .checkpoint_inlined_data()
+                .await
+                .expect("seed checkpoint");
+        }
+
+        // (2) Delete k0..k49 (durable KeyDeletionIndex tombstones over file rows).
+        for i in 0..50 {
+            delete_one(k(i)).await;
+            expected.remove(&k(i));
+        }
+
+        // (3) Re-insert k0..k24 with a NEW value → inline → flush to a HIGH-
+        // watermark snapshot WITHOUT the string-PK re-insert upgrade.
+        for i in 0..25 {
+            upsert(k(i), i + 1000).await;
+            expected.insert(k(i), i + 1000);
+        }
+        provider
+            .checkpoint_inlined_data()
+            .await
+            .expect("reinsert checkpoint");
+
+        // (4) Filler new keys + flushes so the bake has > KEEP_RECENT snapshots
+        // to consolidate, then drive the real maintenance path (bake + subset)
+        // to settle.
+        for i in 100..140 {
+            upsert(k(i), i).await;
+            expected.insert(k(i), i);
+            if i % 10 == 9 {
+                provider
+                    .checkpoint_inlined_data()
+                    .await
+                    .expect("filler checkpoint");
+            }
+        }
+        provider
+            .checkpoint_inlined_data()
+            .await
+            .expect("final checkpoint");
+        for _ in 0..5 {
+            provider
+                .run_compaction_trigger()
+                .await
+                .expect("compaction trigger");
+        }
+
+        // (5) Verify the exact live set.
+        let batches = read_all(&ctx, &provider, "orders").await;
+        let mut actual: std::collections::BTreeMap<String, i64> =
+            std::collections::BTreeMap::new();
+        for batch in &batches {
+            let id_idx = batch.schema().index_of("_id").expect("_id column");
+            let v_idx = batch.schema().index_of("v").expect("v column");
+            let ids = batch
+                .column(id_idx)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("_id is Utf8");
+            let vs = batch
+                .column(v_idx)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("v is Int64");
+            for row in 0..batch.num_rows() {
+                let prev = actual.insert(ids.value(row).to_string(), vs.value(row));
+                assert!(
+                    prev.is_none(),
+                    "duplicate _id {} in scan (two live versions)",
+                    ids.value(row)
+                );
+            }
+        }
+
+        let resurrected: Vec<String> = actual
+            .keys()
+            .filter(|kk| !expected.contains_key(*kk))
+            .cloned()
+            .collect();
+        let vanished: Vec<String> = expected
+            .keys()
+            .filter(|kk| !actual.contains_key(*kk))
+            .cloned()
+            .collect();
+        let stale: Vec<String> = actual
+            .iter()
+            .filter(|(kk, v)| expected.get(*kk).is_some_and(|e| e != *v))
+            .map(|(kk, _)| kk.clone())
+            .collect();
+        assert!(
+            resurrected.is_empty() && vanished.is_empty() && stale.is_empty(),
+            "string-PK reinsert+bake diverged: expected_live={}, actual_live={}; \
+             {} resurrected (deleted rows reappeared) {:?}, {} vanished {:?}, {} stale {:?}",
+            expected.len(),
+            actual.len(),
+            resurrected.len(),
+            resurrected.iter().take(10).collect::<Vec<_>>(),
+            vanished.len(),
+            vanished.iter().take(10).collect::<Vec<_>>(),
+            stale.len(),
+            stale.iter().take(10).collect::<Vec<_>>(),
         );
     }
 

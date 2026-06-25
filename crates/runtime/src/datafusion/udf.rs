@@ -560,6 +560,7 @@ fn denied_spice_function_names() -> Vec<String> {
         INNER_PRODUCT_UDF_NAME,
         L2_DISTANCE_UDF_NAME,
         L2_SQUARED_DISTANCE_UDF_NAME,
+        "date_trunc",
         L2_NORM_UDF_NAME,
         TRUNCATE_SCALAR_UDF_NAME,
         OBJ_DESCRIPTION_UDF_NAME,

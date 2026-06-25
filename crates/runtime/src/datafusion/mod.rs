@@ -1465,7 +1465,16 @@ impl DataFusion {
         // budget-gated append stalls the apply path — pay RAM for freshness.
         // The per-table caps and the spill/durable fallbacks stay the
         // OOM backstops.
-        let mem_tier_budget_bytes = crate::resource_monitor::get_total_memory() / 4;
+        // DEBUG/repro override: `CAYENNE_MEM_TIER_BUDGET_BYTES` forces a tiny
+        // aggregate budget so a single small table spills/checkpoints constantly,
+        // piling up protected snapshots until the seq-prefix bake (and its
+        // deletion-index prune) fires — reproducing the CDC delete-drop without
+        // needing the full multi-table memory pressure. Unset = total_RAM / 4.
+        let mem_tier_budget_bytes = std::env::var("CAYENNE_MEM_TIER_BUDGET_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&b| b > 0)
+            .unwrap_or_else(|| crate::resource_monitor::get_total_memory() / 4);
         cayenne::set_global_mem_tier_bytes(mem_tier_budget_bytes);
         tracing::info!(
             mem_tier_budget_bytes,

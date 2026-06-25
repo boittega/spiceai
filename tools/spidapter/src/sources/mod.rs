@@ -36,7 +36,9 @@ pub(super) fn cayenne_acceleration_params(
             spicepod::param::Params::from_string_map(std::collections::HashMap::from([(
                 "cayenne_force_view_types".to_string(),
                 "false".to_string(),
-            )]))
+            ),
+                ("cayenne_inline_max_rows".to_string(), "0".to_string()),
+            ]))
         })
 }
 

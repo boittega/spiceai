@@ -64,6 +64,27 @@ pub(crate) fn build_local_extra_envs(_setup_config: &SetupConfig) -> HashMap<Str
         "SPICED_LOG".to_string(),
         "info,cayenne=debug,runtime::accelerated_table::refresh_task::changes=trace,data_components=trace".to_string(),
     );
+    map.insert(
+        "CAYENNE_WATERMARK_AUDIT".to_string(),
+        "1".to_string(),
+    );
+    map.insert(
+        "RESURRECTION_DETAIL_LOG".to_string(),
+        "1".to_string(),
+    );
+    // Pass through debug knobs set on the run environment (root-cause loop):
+    // e.g. CAYENNE_BAKE_DELETION_INDEX_TRIGGER to disable/tune the seq-prefix
+    // bake so we can test whether over-claimed watermarks persist without it.
+    for key in [
+        "CAYENNE_BAKE_DELETION_INDEX_TRIGGER",
+        "CAYENNE_INLINE_MAX_ROWS",
+        "CAYENNE_DISABLE_COMPACTION",
+        "CAYENNE_DISABLE_TOMBSTONE_PRUNE",
+    ] {
+        if let Ok(v) = std::env::var(key) {
+            map.insert(key.to_string(), v);
+        }
+    }
     map
 }
 

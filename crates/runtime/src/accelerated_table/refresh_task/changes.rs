@@ -911,6 +911,97 @@ fn parse_env_u64(var: &'static str, default: u64) -> u64 {
     }
 }
 
+/// DEBUG INSTRUMENTATION: connector-independent "shadow" row accounting.
+///
+/// Per accelerated table, we keep the set of primary keys that the stream of
+/// received changes implies SHOULD currently exist. Snapshot rows and live
+/// upserts add their PK; deletes remove it; a truncate clears the table. We then
+/// log the resulting expected row count after every applied change batch, with
+/// the table name. Because change events only exist for real mutations (a delete
+/// of an absent key, or a duplicate insert, produces no event), the set size is
+/// an exact mirror of the source. Comparing it against `SELECT count(*)` on the
+/// accelerator pinpoints whether a divergence is in delivery (this count is
+/// wrong) or in the accelerator's apply/compaction path (this count is right but
+/// the accelerator's is wrong).
+static CDC_SHADOW_PK_SETS: std::sync::LazyLock<
+    parking_lot::Mutex<HashMap<TableReference, std::collections::HashSet<Vec<u8>>>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+/// Replay one received [`ChangeBatch`] into the table's shadow PK set and log the
+/// expected row count afterward. See [`CDC_SHADOW_PK_SETS`].
+///
+/// Keys are encoded with [`encode_primary_key`] over the `data` struct's PK
+/// columns — NOT the batch's `primary_keys` column, which carries PK column
+/// *names* (and is empty for snapshot rows). `pk_col_names` come from the
+/// accelerator's primary-key constraint so the encoding is identical for
+/// snapshot upserts and live deletes of the same row.
+fn cdc_shadow_apply(
+    dataset_name: &TableReference,
+    change_batch: &ChangeBatch,
+    pk_col_names: &[String],
+) {
+    let rows = change_batch.record.num_rows();
+    if rows == 0 {
+        return;
+    }
+    let data_batch = change_batch.data_batch();
+    // Prefer the caller-provided (cayenne) PK names; fall back to the batch's
+    // `primary_keys` column, which holds PK column *names* for live events
+    // (empty for snapshot rows).
+    let fallback_pk_names;
+    let pk_col_names: &[String] = if pk_col_names.is_empty() {
+        fallback_pk_names = change_batch.primary_keys(0);
+        &fallback_pk_names
+    } else {
+        pk_col_names
+    };
+    let pk_col_indices: Vec<usize> = pk_col_names
+        .iter()
+        .filter_map(|name| data_batch.schema().index_of(name).ok())
+        .collect();
+    if pk_col_indices.is_empty() {
+        tracing::warn!(
+            table = %dataset_name,
+            ?pk_col_names,
+            "CDC shadow accounting: could not resolve primary-key columns in the data batch; skipping batch"
+        );
+        return;
+    }
+
+    let mut sets = CDC_SHADOW_PK_SETS.lock();
+    let set = sets.entry(dataset_name.clone()).or_default();
+    let (mut upserts, mut deletes, mut truncates, mut unknown): (u64, u64, u64, u64) =
+        (0, 0, 0, 0);
+    for row in 0..rows {
+        match ChangeOperationType::from_operation(&change_batch.op(row)) {
+            ChangeOperationType::Truncate => {
+                set.clear();
+                truncates += 1;
+            }
+            ChangeOperationType::Upsert => {
+                set.insert(encode_primary_key(&data_batch, &pk_col_indices, row));
+                upserts += 1;
+            }
+            ChangeOperationType::Delete => {
+                set.remove(&encode_primary_key(&data_batch, &pk_col_indices, row));
+                deletes += 1;
+            }
+            ChangeOperationType::Unknown => {
+                unknown += 1;
+            }
+        }
+    }
+    tracing::info!(
+        table = %dataset_name,
+        upserts,
+        deletes,
+        truncates,
+        unknown,
+        expected_rows = set.len(),
+        "CDC shadow expected row count after applying change batch"
+    );
+}
+
 impl RefreshTask {
     pub async fn start_changes_stream(
         &self,
@@ -1365,6 +1456,33 @@ impl RefreshTask {
         metrics::CDC_APPLY_BURST_BYTES
             .record(u64::try_from(burst_bytes).unwrap_or(u64::MAX), &labels);
         metrics::CDC_APPLY_BURST_ROWS_TOTAL.add(burst_rows, &labels);
+
+        // DEBUG: replay every received change row into the per-table shadow PK
+        // set and log the expected row count. Done over the whole received burst
+        // (independent of how it is later split/coalesced/applied) so the count
+        // reflects what was DELIVERED, for comparison against the accelerator.
+        // PK column names: the cayenne provider knows them for every row
+        // (snapshot + live); `constraints()` returns None and the batch's own
+        // `primary_keys` column holds names that are empty for snapshot rows, so
+        // neither works alone. cdc_shadow_apply falls back to the live batch's
+        // `primary_keys` column when this is empty (non-cayenne accelerators).
+        let shadow_pk_col_names: Vec<String> = {
+            #[cfg(not(windows))]
+            {
+                self.cayenne_accelerator()
+                    .map(CayenneTableProvider::primary_key_column_names)
+                    .unwrap_or_default()
+            }
+            #[cfg(windows)]
+            {
+                Vec::new()
+            }
+        };
+        for item in &burst {
+            if let Ok(env) = item {
+                cdc_shadow_apply(context.dataset_name, &env.change_batch, &shadow_pk_col_names);
+            }
+        }
 
         // Walk the burst preserving arrival order, processing contiguous
         // runs of Ok envelopes together and Err items individually so error

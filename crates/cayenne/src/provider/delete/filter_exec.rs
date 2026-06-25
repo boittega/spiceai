@@ -98,6 +98,14 @@ struct DeletionFilterMetrics {
     baseline: BaselineMetrics,
     /// Rows removed because their key was an applicable (visible) deletion.
     rows_deleted: Count,
+    /// DEBUG: rows kept (visible) DESPITE having a tombstone in the index, only
+    /// because the per-snapshot threshold suppressed it (`delete_seq <=
+    /// min_delete_seq_to_apply`) AND the tombstone has no valid re-insert
+    /// (`insert_seq > delete_seq`). For a correctly-baked snapshot this is 0 — a
+    /// row deleted at/below the snapshot's watermark should have been physically
+    /// removed. A nonzero count means the snapshot's watermark OVER-CLAIMS what
+    /// it baked: a delete is silently dropped at scan time → resurrected row.
+    resurrected_by_threshold: Count,
 }
 
 impl DeletionFilterMetrics {
@@ -105,6 +113,8 @@ impl DeletionFilterMetrics {
         Self {
             baseline: BaselineMetrics::new(metrics, partition),
             rows_deleted: MetricBuilder::new(metrics).counter("rows_deleted", partition),
+            resurrected_by_threshold: MetricBuilder::new(metrics)
+                .counter("resurrected_by_threshold", partition),
         }
     }
 }
@@ -160,6 +170,35 @@ fn tombstone_visible(
         InsertRecordHandling::Ignore => false,
     }
 }
+
+/// DEBUG: a threshold-suppressed tombstone that has NO valid re-insert — i.e. a
+/// row that should be deleted but is kept only because the per-snapshot threshold
+/// claims the delete (`delete_seq <= min`) is already baked in. For a correctly
+/// baked snapshot this never happens (such a row would have been physically
+/// removed). Counting these at scan time directly measures resurrected rows.
+#[inline]
+fn is_threshold_resurrection(tombstone: Tombstone, min_delete_seq_to_apply: Option<i64>) -> bool {
+    min_delete_seq_to_apply.is_some_and(|min| tombstone.delete_sequence <= min)
+        && !tombstone
+            .insert_sequence
+            .is_some_and(|insert_seq| insert_seq > tombstone.delete_sequence)
+}
+
+/// DEBUG: gate + budget for per-row resurrection detail logging (gated by
+/// `CAYENNE_WATERMARK_AUDIT`). Logs the exact `(delete_seq, insert_seq,
+/// watermark)` of resurrected rows so we can see the over-claim shape directly
+/// (`insert_seq < delete_seq <= watermark`) instead of inferring it. Budgeted to
+/// avoid flooding the hot scan path.
+static RESURRECTION_DETAIL_LOG: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    std::env::var("CAYENNE_WATERMARK_AUDIT")
+        .map(|v| {
+            let t = v.trim();
+            !t.is_empty() && t != "0"
+        })
+        .unwrap_or(false)
+});
+static RESURRECTION_DETAIL_BUDGET: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(2000);
 
 /// Check if a row with the given Int64 PK is visible (not deleted, or re-inserted after deletion).
 ///
@@ -543,7 +582,29 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                     // returns `true` on `get() == None`. The bloom-empty /
                     // all-visible fast path is preserved below via `deleted`.
                     let mut deleted: Vec<usize> = Vec::new();
+                    let mut resurrected: usize = 0;
                     self.tombstones.get_batch(rows.iter(), |i, tombstone| {
+                        if is_threshold_resurrection(tombstone, self.min_delete_seq_to_apply) {
+                            resurrected += 1;
+                            // DEBUG: dump the exact sequences of resurrected rows
+                            // (budgeted) so the over-claim shape is observed, not
+                            // inferred: insert_seq < delete_seq <= watermark.
+                            if *RESURRECTION_DETAIL_LOG
+                                && RESURRECTION_DETAIL_BUDGET
+                                    .load(std::sync::atomic::Ordering::Relaxed)
+                                    > 0
+                            {
+                                RESURRECTION_DETAIL_BUDGET
+                                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                                tracing::warn!(
+                                    target: "cayenne::compaction",
+                                    delete_seq = tombstone.delete_sequence,
+                                    insert_seq = ?tombstone.insert_sequence,
+                                    watermark = ?self.min_delete_seq_to_apply,
+                                    "Resurrected-row detail: kept though delete_seq <= watermark with no valid re-insert"
+                                );
+                            }
+                        }
                         if !tombstone_visible(
                             tombstone,
                             self.insert_record_handling,
@@ -552,6 +613,9 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                             deleted.push(i);
                         }
                     });
+                    if resurrected > 0 {
+                        self.metrics.resurrected_by_threshold.add(resurrected);
+                    }
                     let keep_count = batch_size - deleted.len();
 
                     tracing::trace!(

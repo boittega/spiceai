@@ -26,4 +26,16 @@ fn main() {
         );
 
     println!("cargo:rustc-env=GIT_COMMIT_HASH={git_hash}");
+
+    // Force this build script to re-run on every build, even when neither the
+    // sources nor the current commit changed since the last build. Cargo only
+    // re-runs build scripts when a package file changes by default, which can
+    // leave GIT_COMMIT_HASH stale (e.g. after `git commit --amend`, a checkout,
+    // or a rebase that doesn't touch this crate's files).
+    //
+    // Pointing `rerun-if-changed` at a path that never exists makes Cargo treat
+    // the build-script fingerprint as perpetually dirty, so the script runs on
+    // every build. (A stamp file in OUT_DIR does NOT work: once written, its
+    // mtime stops changing, so Cargo would consider it up to date.)
+    println!("cargo:rerun-if-changed=.cargo-always-rebuild");
 }
