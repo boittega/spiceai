@@ -14647,14 +14647,14 @@ impl CayenneTableProvider {
             PkDeletionStrategyWithCache::Int64Pk {
                 deletion_snapshot, ..
             } => {
-                let current = deletion_snapshot.load_full();
-                if !current.tombstones.has_deletions() {
+                if !deletion_snapshot.load().tombstones.has_deletions() {
                     return;
                 }
-                // TRACE-KEY: log each traced key whose tombstone this prune removes.
+                // TRACE-KEY (best-effort snapshot): which traced keys this prune removes.
                 if let TraceTargets::Int64(keys) = &*self.trace_targets() {
+                    let snap = deletion_snapshot.load();
                     for &k in keys {
-                        if let Some(t) = current.tombstones.get(k)
+                        if let Some(t) = snap.tombstones.get(k)
                             && t.delete_sequence <= cutoff
                         {
                             tracing::warn!(
@@ -14670,10 +14670,20 @@ impl CayenneTableProvider {
                         }
                     }
                 }
-                let before = current.tombstones.len();
-                let pruned = current.tombstones.prune_deletes_at_or_below(cutoff);
-                let (after, retained_max_seq) = (pruned.len(), pruned.max_sequence_number());
-                deletion_snapshot.store(Arc::new(Int64PkDeletionSnapshot::from_index(pruned)));
+                // ATOMIC prune (lost-update fix): `rcu` re-runs against the LIVE index
+                // on every CAS retry, so a delete-sink store that lands mid-prune is
+                // never clobbered — the retry re-prunes `<= cutoff` and keeps the newer
+                // deletes. Replaces the racy load_full()+store().
+                let mut before = 0usize;
+                let mut after = 0usize;
+                let mut retained_max_seq: Option<i64> = None;
+                deletion_snapshot.rcu(|current| {
+                    before = current.tombstones.len();
+                    let pruned = current.tombstones.prune_deletes_at_or_below(cutoff);
+                    after = pruned.len();
+                    retained_max_seq = pruned.max_sequence_number();
+                    Arc::new(Int64PkDeletionSnapshot::from_index(pruned))
+                });
                 self.refresh_deletion_memory_accounting();
                 self.trace_deletion_store_now("prune");
                 (before, after, retained_max_seq)
@@ -14681,14 +14691,14 @@ impl CayenneTableProvider {
             PkDeletionStrategyWithCache::RowConverterBased {
                 deletion_snapshot, ..
             } => {
-                let current = deletion_snapshot.load_full();
-                if !current.tombstones.has_deletions() {
+                if !deletion_snapshot.load().tombstones.has_deletions() {
                     return;
                 }
-                // TRACE-KEY: log each traced key whose tombstone this prune removes.
+                // TRACE-KEY (best-effort snapshot): which traced keys this prune removes.
                 if let TraceTargets::Bytes(keys) = &*self.trace_targets() {
+                    let snap = deletion_snapshot.load();
                     for k in keys {
-                        if let Some(t) = current.tombstones.get(k)
+                        if let Some(t) = snap.tombstones.get(k)
                             && t.delete_sequence <= cutoff
                         {
                             tracing::warn!(
@@ -14704,10 +14714,18 @@ impl CayenneTableProvider {
                         }
                     }
                 }
-                let before = current.tombstones.len();
-                let pruned = current.tombstones.prune_deletes_at_or_below(cutoff);
-                let (after, retained_max_seq) = (pruned.len(), pruned.max_sequence_number());
-                deletion_snapshot.store(Arc::new(RowConverterDeletionSnapshot::from_index(pruned)));
+                // ATOMIC prune (lost-update fix): see the Int64 arm — `rcu` re-runs
+                // against the LIVE index so a concurrent delete is never clobbered.
+                let mut before = 0usize;
+                let mut after = 0usize;
+                let mut retained_max_seq: Option<i64> = None;
+                deletion_snapshot.rcu(|current| {
+                    before = current.tombstones.len();
+                    let pruned = current.tombstones.prune_deletes_at_or_below(cutoff);
+                    after = pruned.len();
+                    retained_max_seq = pruned.max_sequence_number();
+                    Arc::new(RowConverterDeletionSnapshot::from_index(pruned))
+                });
                 self.refresh_deletion_memory_accounting();
                 self.trace_deletion_store_now("prune");
                 (before, after, retained_max_seq)

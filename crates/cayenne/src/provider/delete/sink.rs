@@ -741,14 +741,21 @@ impl CayenneDeletionSink {
         };
 
         // Build a fresh snapshot with the new deletions and publish via ArcSwap.
-        // Writes are serialised by the per-table write lock so the load+rebuild+store
-        // sequence is race-free.
-        let updated = current
-            .tombstones
-            .extend_max_deletes(written_row_keys.iter().map(|key| (key, delete_sequence)));
-        let store_len = updated.len();
-        let store_max = updated.max_sequence_number();
-        deletion_snapshot.store(Arc::new(RowConverterDeletionSnapshot::from_index(updated)));
+        // ATOMIC add (lost-update fix): `rcu` re-extends against the LIVE index on
+        // every CAS retry, so a concurrent compaction prune (or another writer) that
+        // stores between our load and store can never clobber this delete batch.
+        // (The per-table write_lock serialises deletes against each other, but NOT
+        // against the bake's prune, which runs under compaction_lock/listing_fence.)
+        let mut store_len = 0usize;
+        let mut store_max: Option<i64> = None;
+        deletion_snapshot.rcu(|current| {
+            let updated = current
+                .tombstones
+                .extend_max_deletes(written_row_keys.iter().map(|key| (key, delete_sequence)));
+            store_len = updated.len();
+            store_max = updated.max_sequence_number();
+            Arc::new(RowConverterDeletionSnapshot::from_index(updated))
+        });
         self.refresh_deletion_memory_accounting();
         super::super::table::trace_deletion_store(
             table_name,
@@ -889,12 +896,17 @@ impl CayenneDeletionSink {
         // Build a fresh snapshot with the new deletions and publish via ArcSwap.
         // Writes are serialised by the per-table write lock so the load+rebuild+store
         // sequence is race-free.
-        let updated = current
-            .tombstones
-            .extend_max_deletes(pk_values.iter().map(|&pk| (pk, delete_sequence)));
-        let store_len = updated.len();
-        let store_max = updated.max_sequence_number();
-        deletion_snapshot.store(Arc::new(Int64PkDeletionSnapshot::from_index(updated)));
+        // ATOMIC add (lost-update fix): see the key-based path above.
+        let mut store_len = 0usize;
+        let mut store_max: Option<i64> = None;
+        deletion_snapshot.rcu(|current| {
+            let updated = current
+                .tombstones
+                .extend_max_deletes(pk_values.iter().map(|&pk| (pk, delete_sequence)));
+            store_len = updated.len();
+            store_max = updated.max_sequence_number();
+            Arc::new(Int64PkDeletionSnapshot::from_index(updated))
+        });
         self.refresh_deletion_memory_accounting();
         super::super::table::trace_deletion_store(
             table_name,
