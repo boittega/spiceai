@@ -32571,6 +32571,202 @@ mod tests {
         );
     }
 
+    /// CONCURRENCY REGRESSION — the deletion-index lost-update race between the
+    /// delete sink (`write_lock`) and the seq-prefix bake's prune
+    /// (`compaction_lock`). Both do a read-modify-write on the SAME
+    /// `deletion_snapshot` `ArcSwap`. When a delete batch's `store()` lands between
+    /// the prune's `load_full()` and its `store()`, the prune's blind store
+    /// overwrites the batch — its tombstones vanish (NOT pruned, NOT watermark-
+    /// exempt) and the deleted rows resurrect (`actual > expected`).
+    ///
+    /// Drives the REAL paths in parallel: a background `run_compaction_trigger`
+    /// loop (bake → prune) against a foreground upsert/delete stream on a
+    /// multi-thread runtime. With the racy `load_full()+store()` this FAILS
+    /// (resurrected rows); with the `rcu` (compare-and-swap, retry-on-conflict)
+    /// fix it PASSES.
+    ///
+    /// `#[ignore]`d: multi-threaded stress (a few seconds, real Vortex I/O). Run:
+    /// `cargo test -p cayenne cdc_concurrent_delete_vs_prune_lost_update -- --ignored --nocapture`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "multi-threaded deletion-index lost-update stress test; run with --ignored"]
+    async fn cdc_concurrent_delete_vs_prune_lost_update() {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use datafusion_expr::lit;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        fn k(n: i64) -> String {
+            format!("k-{n:08}")
+        }
+
+        let ctx = SessionContext::new();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str path"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str path"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog created"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_id", DataType::Utf8, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let options = CreateTableOptions {
+            table_name: "orders".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec!["_id".to_string()],
+            on_conflict: Some(OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "_id".to_string(),
+                ]),
+            )),
+            base_path: data_dir,
+            partition_column: None,
+            vortex_config: VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::File,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 64,
+                // Bake (and its prune) fires on any tombstone so the race window is open.
+                bake_deletion_index_trigger: 1,
+                compaction_trigger_protected_snapshots: 2,
+                compaction_background_interval_ms: 3_600_000,
+                cdc_mem_tier_checkpoint_interval_ms: 0,
+                ..VortexConfig::default()
+            },
+        };
+        let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
+            .create(options)
+            .await
+            .expect("table created");
+
+        let upsert = |id: String, v: i64| {
+            let provider = &provider;
+            let ctx = &ctx;
+            let schema = Arc::clone(&schema);
+            async move {
+                let batch = RecordBatch::try_new(
+                    schema,
+                    vec![
+                        Arc::new(StringArray::from(vec![id.as_str()])),
+                        Arc::new(Int64Array::from(vec![v])),
+                    ],
+                )
+                .expect("batch is valid");
+                let w = provider
+                    .write_cdc_append_stream(single_batch_stream(batch), &ctx.task_ctx())
+                    .await
+                    .expect("cdc upsert");
+                if w.has_pending_finalize() {
+                    w.finish().await.expect("cdc upsert finalize");
+                }
+            }
+        };
+        let delete_one = |id: String| {
+            let provider = &provider;
+            let ctx = &ctx;
+            async move {
+                let plan = provider
+                    .delete_from(&ctx.state(), vec![col("_id").eq(lit(id.as_str()))])
+                    .await
+                    .expect("delete plan");
+                collect(plan, ctx.task_ctx())
+                    .await
+                    .expect("delete executed");
+            }
+        };
+
+        // Seed base keys across flushed snapshots so the bake always has a prefix.
+        const BASE: i64 = 10_000;
+        let mut expected: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for i in 0..BASE {
+            upsert(k(i), i).await;
+            expected.insert(k(i));
+            if (i + 1) % 1000 == 0 {
+                provider
+                    .checkpoint_inlined_data()
+                    .await
+                    .expect("seed checkpoint");
+            }
+        }
+        provider
+            .checkpoint_inlined_data()
+            .await
+            .expect("seed final checkpoint");
+
+        // Background bake+prune loop (compaction_lock) — races foreground deletes.
+        let stop = Arc::new(AtomicBool::new(false));
+        let bg = provider.clone_for_write();
+        let bg_stop = Arc::clone(&stop);
+        let bg_handle = tokio::spawn(async move {
+            while !bg_stop.load(Ordering::Relaxed) {
+                let _ = bg.run_compaction_trigger().await;
+                tokio::task::yield_now().await;
+            }
+        });
+
+        // Foreground: keep protected snapshots flowing (new upserts → bake inputs)
+        // and delete base keys in batches — concurrent with the background prune.
+        let mut new_id = BASE;
+        let mut next_del = 0i64;
+        const ROUNDS: usize = 50;
+        for _ in 0..ROUNDS {
+            for _ in 0..30 {
+                upsert(k(new_id), new_id).await;
+                expected.insert(k(new_id));
+                new_id += 1;
+            }
+            provider
+                .checkpoint_inlined_data()
+                .await
+                .expect("round checkpoint");
+            for _ in 0..150 {
+                if next_del >= BASE {
+                    break;
+                }
+                let id = k(next_del);
+                delete_one(id.clone()).await;
+                expected.remove(&id);
+                next_del += 1;
+            }
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        let _ = bg_handle.await;
+        // Drain compaction so any final bake settles.
+        for _ in 0..6 {
+            let _ = provider.run_compaction_trigger().await;
+        }
+
+        // The scanned live set must EXACTLY equal `expected`. A lost-update drops a
+        // delete batch's tombstones → those ids reappear (`resurrected`).
+        let batches = read_all(&ctx, &provider, "orders").await;
+        let mut actual: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for batch in &batches {
+            let id_idx = batch.schema().index_of("_id").expect("_id column");
+            let ids = batch
+                .column(id_idx)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("_id is Utf8");
+            for r in 0..batch.num_rows() {
+                actual.insert(ids.value(r).to_string());
+            }
+        }
+        let resurrected: Vec<&String> = actual.difference(&expected).collect();
+        let vanished: Vec<&String> = expected.difference(&actual).collect();
+        assert!(
+            resurrected.is_empty() && vanished.is_empty(),
+            "deletion-index lost-update race: {} resurrected (deleted rows reappeared) {:?}, \
+             {} vanished {:?}",
+            resurrected.len(),
+            resurrected.iter().take(10).collect::<Vec<_>>(),
+            vanished.len(),
+            vanished.iter().take(10).collect::<Vec<_>>(),
+        );
+    }
+
     // ========================================================================
     // Staged inline-conflict tombstones (Option D — durable per-tombstone
     // `published` flag). Inline-bearing upserts now PIPELINE (stage inert) like
