@@ -3507,6 +3507,148 @@ fn tombstone_prune_disabled() -> bool {
         .unwrap_or(false)
 }
 
+/// DEBUG forensic key trace (`CAYENNE_TRACE_KEYS=<id>,<id>,...`): the comma-split
+/// raw tokens, parsed once. When set, the table logs every operation that touches
+/// one of these primary keys (delete, upsert tombstone+reinsert, prune, snapshot
+/// publish) under target `cayenne::trace`, so the full lifecycle of a known-bad
+/// key (e.g. an over-counted `_id` dumped by spicebench's OVERCOUNT-DIAG) can be
+/// reconstructed from the log. Scoped to a handful of keys so it stays greppable
+/// at SF1 scale (logging every key would be terabytes).
+pub(crate) fn trace_keys_enabled() -> bool {
+    trace_keys_raw().is_some()
+}
+
+fn trace_keys_raw() -> Option<&'static Vec<String>> {
+    static TOKENS: std::sync::OnceLock<Option<Vec<String>>> = std::sync::OnceLock::new();
+    TOKENS
+        .get_or_init(|| {
+            // Prefer a file (`CAYENNE_TRACE_KEYS_FILE`, one id per line) — the key
+            // set can be hundreds of thousands of ids, too large for an env var.
+            // Fall back to an inline comma list (`CAYENNE_TRACE_KEYS`).
+            let from_file = std::env::var("CAYENNE_TRACE_KEYS_FILE").ok().and_then(|path| {
+                std::fs::read_to_string(&path)
+                    .map_err(|e| {
+                        tracing::warn!(target: "cayenne::trace", path, %e, "CAYENNE_TRACE_KEYS_FILE unreadable");
+                        e
+                    })
+                    .ok()
+            });
+            let raw = from_file.or_else(|| std::env::var("CAYENNE_TRACE_KEYS").ok());
+            raw.and_then(|v| {
+                let toks: Vec<String> = v
+                    .split([',', '\n', '\r'])
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                (!toks.is_empty()).then_some(toks)
+            })
+        })
+        .as_ref()
+}
+
+/// Per-table encoded form of [`trace_keys_raw`]: the trace tokens encoded into the
+/// SAME key representation the deletion index / scan uses, so a site-level key can
+/// be matched with an O(1) set lookup.
+pub(crate) enum TraceTargets {
+    /// Tracing disabled (`CAYENNE_TRACE_KEYS` unset) or unsupported PK shape.
+    Disabled,
+    /// `Int64Pk` table: the tokens parsed as `i64`.
+    Int64(std::collections::HashSet<i64>),
+    /// `RowConverterBased` single-column PK: tokens encoded via the row converter.
+    Bytes(std::collections::HashSet<Vec<u8>>),
+}
+
+impl TraceTargets {
+    pub(crate) fn enabled(&self) -> bool {
+        !matches!(self, TraceTargets::Disabled)
+    }
+    #[allow(dead_code)] // used by the Int64 delete-sink trace (not wired; tables here are string-PK)
+    pub(crate) fn has_i64(&self, pk: i64) -> bool {
+        matches!(self, TraceTargets::Int64(s) if s.contains(&pk))
+    }
+    pub(crate) fn has_bytes(&self, key: &[u8]) -> bool {
+        matches!(self, TraceTargets::Bytes(s) if s.contains(key))
+    }
+}
+
+fn trace_targets_cache() -> &'static std::sync::Mutex<HashMap<String, Arc<TraceTargets>>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Arc<TraceTargets>>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Human-readable rendering of a trace key (8-byte LE int64 → the integer;
+/// otherwise hex of the row-converter key bytes). Free function so both the table
+/// provider and the deletion sink can use it.
+pub(crate) fn format_pk_key(key: &[u8]) -> String {
+    if let Ok(bytes) = <[u8; 8]>::try_from(key) {
+        i64::from_le_bytes(bytes).to_string()
+    } else {
+        key.iter().map(|b| format!("{b:02x}")).collect()
+    }
+}
+
+/// Free-function `TRACE-STORE` logger (for the deletion sink, which isn't a
+/// `CayenneTableProvider`). Logs the deletion index's `len`/`max_seq` after a
+/// store, tagged with `site`. A backwards move in `max_seq` across consecutive
+/// `TRACE-STORE` lines = a lost-update race; the lower line's `site` names it.
+pub(crate) fn trace_deletion_store(table_name: &str, site: &str, len: usize, max_seq: Option<i64>) {
+    if trace_keys_raw().is_none() {
+        return;
+    }
+    tracing::warn!(
+        target: "cayenne::trace",
+        table = table_name,
+        op = "store",
+        site,
+        len,
+        max_seq = max_seq.unwrap_or(-1),
+        "TRACE-STORE: deletion index stored (watch max_seq for a backwards move = lost-update)"
+    );
+}
+
+/// Encode the `CAYENNE_TRACE_KEYS` tokens into row-converter key bytes via
+/// `converter` (single-column PK assumed). `Disabled` if the tokens can't be
+/// encoded (PK type mismatch).
+fn build_bytes_trace_targets(tokens: &[String], converter: &RowConverter) -> TraceTargets {
+    let arr =
+        arrow::array::StringArray::from(tokens.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+    let cols: Vec<arrow::array::ArrayRef> = vec![Arc::new(arr)];
+    match converter.convert_columns(&cols) {
+        Ok(rows) => TraceTargets::Bytes(
+            (0..tokens.len()).map(|i| rows.row(i).as_ref().to_vec()).collect(),
+        ),
+        Err(_) => TraceTargets::Disabled,
+    }
+}
+
+/// Resolve + cache the [`TraceTargets`] for a row-converter (string-PK) table,
+/// keyed by `table_id`. Used by the deletion sink, which holds its own
+/// `pk_row_converter` but not the table provider's methods.
+pub(crate) fn trace_targets_row_keys(table_id: &str, converter: &RowConverter) -> Arc<TraceTargets> {
+    let Some(tokens) = trace_keys_raw() else {
+        return Arc::new(TraceTargets::Disabled);
+    };
+    let cache = trace_targets_cache();
+    if let Some(t) = cache.lock().unwrap().get(table_id) {
+        return Arc::clone(t);
+    }
+    let built = Arc::new(build_bytes_trace_targets(tokens, converter));
+    let matched = match &*built {
+        TraceTargets::Bytes(s) => s.len(),
+        _ => 0,
+    };
+    tracing::warn!(
+        target: "cayenne::trace",
+        table_id,
+        tokens = tokens.len(),
+        matched,
+        "CAYENNE_TRACE_KEYS active (row-key path)"
+    );
+    cache.lock().unwrap().insert(table_id.to_string(), Arc::clone(&built));
+    built
+}
+
 /// Default deletion-index size (count of live PK tombstones, `delete_len()`) at
 /// or above which a seq-prefix bake is worth triggering. The bake exists to
 /// shrink this index, so it is gated on the very quantity it reduces: below this
@@ -8704,6 +8846,7 @@ impl CayenneTableProvider {
                 let index_len = updated.len();
                 deletion_snapshot.store(Arc::new(Int64PkDeletionSnapshot::from_index(updated)));
                 self.refresh_deletion_memory_accounting();
+                self.trace_deletion_store_now("file_del_cache");
                 tracing::info!(
                     target: "cayenne::compaction",
                     table = self.table_metadata.table_name.as_str(),
@@ -8727,6 +8870,7 @@ impl CayenneTableProvider {
                 deletion_snapshot
                     .store(Arc::new(RowConverterDeletionSnapshot::from_index(updated)));
                 self.refresh_deletion_memory_accounting();
+                self.trace_deletion_store_now("file_del_cache");
                 tracing::info!(
                     target: "cayenne::compaction",
                     table = self.table_metadata.table_name.as_str(),
@@ -9855,6 +9999,7 @@ impl CayenneTableProvider {
                 );
                 deletion_snapshot.store(Arc::new(Int64PkDeletionSnapshot::from_index(updated)));
                 self.refresh_deletion_memory_accounting();
+                self.trace_deletion_store_now("on_conflict_publish");
             }
             PkDeletionStrategyWithCache::RowConverterBased {
                 deletion_snapshot, ..
@@ -9868,6 +10013,7 @@ impl CayenneTableProvider {
                 deletion_snapshot
                     .store(Arc::new(RowConverterDeletionSnapshot::from_index(updated)));
                 self.refresh_deletion_memory_accounting();
+                self.trace_deletion_store_now("on_conflict_publish");
             }
             PkDeletionStrategyWithCache::PositionBased { .. } => {
                 return Err(CatalogError::InvalidOperationNoSource {
@@ -10350,6 +10496,7 @@ impl CayenneTableProvider {
                     deletion_snapshot.store(snapshot);
                 }
                 self.refresh_deletion_memory_accounting();
+                self.trace_deletion_store_now("on_conflict_commit");
             }
             OnConflictDeletionUpdate::RowConverter(snapshot) => {
                 if let PkDeletionStrategyWithCache::RowConverterBased {
@@ -10359,6 +10506,7 @@ impl CayenneTableProvider {
                     deletion_snapshot.store(snapshot);
                 }
                 self.refresh_deletion_memory_accounting();
+                self.trace_deletion_store_now("on_conflict_commit");
             }
         }
     }
@@ -13251,6 +13399,76 @@ impl CayenneTableProvider {
         }
     }
 
+    /// Resolve (and cache per table) the [`TraceTargets`] for `CAYENNE_TRACE_KEYS`.
+    /// Built once per `table_id`: `Int64Pk` parses tokens as `i64`; a single-column
+    /// `RowConverterBased` PK encodes tokens through the row converter (covers the
+    /// mongo `_id` Utf8 case). Anything else (composite PK, non-encodable) →
+    /// `Disabled` with a one-time warning.
+    pub(crate) fn trace_targets(&self) -> Arc<TraceTargets> {
+        let Some(tokens) = trace_keys_raw() else {
+            return Arc::new(TraceTargets::Disabled);
+        };
+        let cache = trace_targets_cache();
+        if let Some(t) = cache.lock().unwrap().get(&self.table_metadata.table_id) {
+            return Arc::clone(t);
+        }
+        let built = Arc::new(self.build_trace_targets(tokens));
+        cache
+            .lock()
+            .unwrap()
+            .insert(self.table_metadata.table_id.clone(), Arc::clone(&built));
+        built
+    }
+
+    fn build_trace_targets(&self, tokens: &[String]) -> TraceTargets {
+        if self.pk_deletion_strategy.is_int64_pk() {
+            let set: std::collections::HashSet<i64> =
+                tokens.iter().filter_map(|t| t.parse::<i64>().ok()).collect();
+            tracing::info!(
+                target: "cayenne::trace",
+                table = self.table_metadata.table_name.as_str(),
+                kind = "int64",
+                tokens = tokens.len(),
+                matched = set.len(),
+                "CAYENNE_TRACE_KEYS active"
+            );
+            return TraceTargets::Int64(set);
+        }
+        // RowConverterBased: encode tokens through the PK converter so they match
+        // the deletion-index/scan key bytes. Single-column PK only.
+        let Ok(Some(pk_indices)) = self.primary_key_indices() else {
+            return TraceTargets::Disabled;
+        };
+        if pk_indices.len() != 1 {
+            tracing::warn!(
+                target: "cayenne::trace",
+                table = self.table_metadata.table_name.as_str(),
+                "CAYENNE_TRACE_KEYS unsupported: composite PK; key trace disabled for this table"
+            );
+            return TraceTargets::Disabled;
+        }
+        let Ok(converter) = self.build_pk_converter(&pk_indices) else {
+            return TraceTargets::Disabled;
+        };
+        let targets = build_bytes_trace_targets(tokens, &converter);
+        match &targets {
+            TraceTargets::Bytes(set) => tracing::info!(
+                target: "cayenne::trace",
+                table = self.table_metadata.table_name.as_str(),
+                kind = "row_converter",
+                tokens = tokens.len(),
+                matched = set.len(),
+                "CAYENNE_TRACE_KEYS active"
+            ),
+            _ => tracing::warn!(
+                target: "cayenne::trace",
+                table = self.table_metadata.table_name.as_str(),
+                "CAYENNE_TRACE_KEYS: PK not single Utf8; could not encode tokens; trace disabled"
+            ),
+        }
+        targets
+    }
+
     /// DEBUG: collect the set of currently-VISIBLE primary keys via the REAL
     /// merge-on-read scan (`self.scan`) — the same path queries use, so it unions
     /// the listing table, ALL protected snapshots (including a freshly-swapped
@@ -13362,7 +13580,7 @@ impl CayenneTableProvider {
             if Self::key_had_pruned_tombstone(deletion_snapshot, key, prefix_cutoff) {
                 prune_resurrected += 1;
                 if sample.len() < 20 {
-                    sample.push(Self::format_pk_key(key));
+                    sample.push(format_pk_key(key));
                 }
             } else {
                 other_newly_visible += 1;
@@ -13397,16 +13615,6 @@ impl CayenneTableProvider {
                 count_delta,
                 "Prune visibility audit clean: no key flipped hidden->visible due to a pruned tombstone"
             );
-        }
-    }
-
-    /// Human-readable rendering of a PK key encoded by [`Self::scan_visible_pk_set`]
-    /// (8-byte LE int64 → the integer; otherwise hex of the row-converter bytes).
-    fn format_pk_key(key: &[u8]) -> String {
-        if let Ok(bytes) = <[u8; 8]>::try_from(key) {
-            i64::from_le_bytes(bytes).to_string()
-        } else {
-            key.iter().map(|b| format!("{b:02x}")).collect()
         }
     }
 
@@ -14443,11 +14651,31 @@ impl CayenneTableProvider {
                 if !current.tombstones.has_deletions() {
                     return;
                 }
+                // TRACE-KEY: log each traced key whose tombstone this prune removes.
+                if let TraceTargets::Int64(keys) = &*self.trace_targets() {
+                    for &k in keys {
+                        if let Some(t) = current.tombstones.get(k)
+                            && t.delete_sequence <= cutoff
+                        {
+                            tracing::warn!(
+                                target: "cayenne::trace",
+                                table = self.table_metadata.table_name.as_str(),
+                                op = "prune",
+                                pk = k,
+                                delete_seq = t.delete_sequence,
+                                insert_seq = t.insert_sequence.unwrap_or(-1),
+                                cutoff,
+                                "TRACE-KEY: tombstone PRUNED (delete_seq <= cutoff) — removed from deletion index"
+                            );
+                        }
+                    }
+                }
                 let before = current.tombstones.len();
                 let pruned = current.tombstones.prune_deletes_at_or_below(cutoff);
                 let (after, retained_max_seq) = (pruned.len(), pruned.max_sequence_number());
                 deletion_snapshot.store(Arc::new(Int64PkDeletionSnapshot::from_index(pruned)));
                 self.refresh_deletion_memory_accounting();
+                self.trace_deletion_store_now("prune");
                 (before, after, retained_max_seq)
             }
             PkDeletionStrategyWithCache::RowConverterBased {
@@ -14457,11 +14685,31 @@ impl CayenneTableProvider {
                 if !current.tombstones.has_deletions() {
                     return;
                 }
+                // TRACE-KEY: log each traced key whose tombstone this prune removes.
+                if let TraceTargets::Bytes(keys) = &*self.trace_targets() {
+                    for k in keys {
+                        if let Some(t) = current.tombstones.get(k)
+                            && t.delete_sequence <= cutoff
+                        {
+                            tracing::warn!(
+                                target: "cayenne::trace",
+                                table = self.table_metadata.table_name.as_str(),
+                                op = "prune",
+                                pk = format_pk_key(k),
+                                delete_seq = t.delete_sequence,
+                                insert_seq = t.insert_sequence.unwrap_or(-1),
+                                cutoff,
+                                "TRACE-KEY: tombstone PRUNED (delete_seq <= cutoff) — removed from deletion index"
+                            );
+                        }
+                    }
+                }
                 let before = current.tombstones.len();
                 let pruned = current.tombstones.prune_deletes_at_or_below(cutoff);
                 let (after, retained_max_seq) = (pruned.len(), pruned.max_sequence_number());
                 deletion_snapshot.store(Arc::new(RowConverterDeletionSnapshot::from_index(pruned)));
                 self.refresh_deletion_memory_accounting();
+                self.trace_deletion_store_now("prune");
                 (before, after, retained_max_seq)
             }
             PkDeletionStrategyWithCache::PositionBased { .. } => {
@@ -14481,6 +14729,42 @@ impl CayenneTableProvider {
             tombstones_pruned = before.saturating_sub(after),
             retained_max_delete_seq = retained_max_seq,
             "Pruned in-memory deletion index at or below seq-prefix cutoff"
+        );
+    }
+
+    /// DEBUG (CAYENNE_TRACE_KEYS): log the LIVE deletion-index state right after a
+    /// `deletion_snapshot.store(...)`, tagged with the call `site`. Tracking the
+    /// `max_seq`/`len` across every store reveals a lost-update race: if `max_seq`
+    /// moves BACKWARDS between two consecutive stores (e.g. 581 -> 580), the store
+    /// on the lower line overwrote a concurrently-added delete batch — and its
+    /// `site` names the racing writer. No-op unless tracing is enabled.
+    fn trace_deletion_store_now(&self, site: &str) {
+        if trace_keys_raw().is_none() {
+            return;
+        }
+        let (len, max_seq) = match &self.pk_deletion_strategy {
+            PkDeletionStrategyWithCache::Int64Pk {
+                deletion_snapshot, ..
+            } => {
+                let s = deletion_snapshot.load();
+                (s.tombstones.len(), s.tombstones.max_sequence_number())
+            }
+            PkDeletionStrategyWithCache::RowConverterBased {
+                deletion_snapshot, ..
+            } => {
+                let s = deletion_snapshot.load();
+                (s.tombstones.len(), s.tombstones.max_sequence_number())
+            }
+            PkDeletionStrategyWithCache::PositionBased { .. } => (0, None),
+        };
+        tracing::warn!(
+            target: "cayenne::trace",
+            table = self.table_metadata.table_name.as_str(),
+            op = "store",
+            site,
+            len,
+            max_seq = max_seq.unwrap_or(-1),
+            "TRACE-STORE: deletion index stored (watch max_seq for a backwards move = lost-update)"
         );
     }
 

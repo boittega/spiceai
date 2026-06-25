@@ -1569,6 +1569,22 @@ impl MetadataCatalog for CayenneCatalog {
             })
             .await;
 
+        // TRACE (CAYENNE_TRACE_KEYS): record the DURABLE metastore delete-file row
+        // so we can tell whether a lost delete is in-memory-only (metastore/disk
+        // still hold it) or durable. Path is the on-disk deletion-vector file.
+        if crate::provider::table::trace_keys_enabled() {
+            tracing::warn!(
+                target: "cayenne::trace",
+                op = "metastore_add_delete_file",
+                table_id = delete_file.table_id.as_str(),
+                seq = delete_file.sequence_number,
+                reinsert_seq = delete_file.reinsert_sequence.unwrap_or(-1),
+                delete_count = delete_file.delete_count,
+                path = delete_file.path.as_str(),
+                "TRACE-META: deletion-vector file recorded in metastore (durable)"
+            );
+        }
+
         match insert_result {
             Ok(()) => Ok(delete_file_id),
             Err(CatalogError::ConstraintViolation { message })
@@ -1667,6 +1683,16 @@ impl MetadataCatalog for CayenneCatalog {
         params.push(MetastoreValue::Text(table_id.to_string()));
         for id in delete_file_ids {
             params.push(MetastoreValue::Text(id.clone()));
+        }
+
+        if crate::provider::table::trace_keys_enabled() {
+            tracing::warn!(
+                target: "cayenne::trace",
+                op = "metastore_remove_delete_files",
+                table_id,
+                count = delete_file_ids.len(),
+                "TRACE-META: deletion-vector files REMOVED from metastore (durable record dropped)"
+            );
         }
 
         self.metastore

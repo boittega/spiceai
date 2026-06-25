@@ -80,6 +80,9 @@ pub(crate) fn build_local_extra_envs(_setup_config: &SetupConfig) -> HashMap<Str
         "CAYENNE_INLINE_MAX_ROWS",
         "CAYENNE_DISABLE_COMPACTION",
         "CAYENNE_DISABLE_TOMBSTONE_PRUNE",
+        // Forensic per-key trace: log every delete/prune touching these PKs.
+        "CAYENNE_TRACE_KEYS",
+        "CAYENNE_TRACE_KEYS_FILE",
     ] {
         if let Ok(v) = std::env::var(key) {
             map.insert(key.to_string(), v);

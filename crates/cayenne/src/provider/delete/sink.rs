@@ -746,8 +746,40 @@ impl CayenneDeletionSink {
         let updated = current
             .tombstones
             .extend_max_deletes(written_row_keys.iter().map(|key| (key, delete_sequence)));
+        let store_len = updated.len();
+        let store_max = updated.max_sequence_number();
         deletion_snapshot.store(Arc::new(RowConverterDeletionSnapshot::from_index(updated)));
         self.refresh_deletion_memory_accounting();
+        super::super::table::trace_deletion_store(
+            table_name,
+            "delete_sink_key",
+            store_len,
+            store_max,
+        );
+
+        // TRACE-KEY: log each traced key as it is deleted (tombstone added to the
+        // deletion index at `delete_sequence`). Uses the sink's own pk_row_converter
+        // to encode the trace tokens to matching key bytes.
+        if let Some(converter) = self.pk_row_converter.as_ref() {
+            let tt = super::super::table::trace_targets_row_keys(
+                &self.table_metadata.table_id,
+                converter,
+            );
+            if tt.enabled() {
+                for key in written_row_keys {
+                    if tt.has_bytes(key.as_ref()) {
+                        tracing::warn!(
+                            target: "cayenne::trace",
+                            table = table_name.as_str(),
+                            op = "delete",
+                            pk = super::super::table::format_pk_key(key.as_ref()),
+                            delete_seq = delete_sequence,
+                            "TRACE-KEY: DELETE recorded — tombstone added to deletion index"
+                        );
+                    }
+                }
+            }
+        }
 
         let deleted_count =
             convert_to_u64_box(new_deletion_count, "deleted row count").map_err(|e| {
@@ -860,8 +892,16 @@ impl CayenneDeletionSink {
         let updated = current
             .tombstones
             .extend_max_deletes(pk_values.iter().map(|&pk| (pk, delete_sequence)));
+        let store_len = updated.len();
+        let store_max = updated.max_sequence_number();
         deletion_snapshot.store(Arc::new(Int64PkDeletionSnapshot::from_index(updated)));
         self.refresh_deletion_memory_accounting();
+        super::super::table::trace_deletion_store(
+            table_name,
+            "delete_sink_int64",
+            store_len,
+            store_max,
+        );
 
         let deleted_count =
             convert_to_u64_box(new_deletion_count, "deleted row count").map_err(|e| {
