@@ -6927,8 +6927,17 @@ impl CayenneTableProvider {
                 // existing validate path). Only the `Bloom` existence view supports
                 // the MISS test; the `Exact` view's O(1) probe already short-circuits
                 // an absent key, so it runs the whole sub-batch through validation.
+                //
+                // The MISS fast path is safe ONLY with no pending deletions: a bloom
+                // tracks VISIBLE keys, so a deleted key (which carries a pending
+                // tombstone) is also a "miss". Appending such a row verbatim — with
+                // no on-conflict insert-record — leaves the re-inserted row hidden by
+                // the tombstone (a row is visible iff `insert_seq > delete_seq`).
+                // When deletions are pending, route the whole sub-batch through full
+                // validation (`apply_on_conflict_to_batch`, whose Bloom branch records
+                // the needed insert-record for a tombstoned miss).
                 let hit_batch = match index.existence_ref(s) {
-                    PkExistenceRef::Bloom(bloom) => {
+                    PkExistenceRef::Bloom(bloom) if !self.has_pending_deletions() => {
                         let (miss, hit, miss_keys) = Self::bloom_split_shard_batch(
                             &batch,
                             bloom,
@@ -6947,7 +6956,7 @@ impl CayenneTableProvider {
                         }
                         hit
                     }
-                    PkExistenceRef::Exact(_) => Some(batch),
+                    _ => Some(batch),
                 };
 
                 let Some(hit_batch) = hit_batch else {
